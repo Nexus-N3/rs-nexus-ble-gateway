@@ -38,7 +38,8 @@ int ble_scheduler_connect_addresses(
     uint8_t sensor_count
 );
 int ble_scheduler_disconnect_addresses(
-    char addresses[][GATEWAY_MAX_ADDRESS_LEN],
+    const char *request_id,
+    const char addresses[][GATEWAY_MAX_ADDRESS_LEN],
     uint8_t address_count
 );
 int ble_scheduler_subscribe(

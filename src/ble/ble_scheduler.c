@@ -32,9 +32,10 @@ buffering
 #include <zephyr/kernel.h>
 
 static ble_scheduler_state_t g_state = SCHEDULER_STATE_IDLE;
-static char g_scan_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 static int64_t g_scan_deadline_ms;
 static bool g_scan_active;
+static char g_scan_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
+static char g_disconnect_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 static char g_connect_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 static gateway_sensor_t g_sensors[GATEWAY_MAX_SENSORS];
 static uint8_t g_sensor_count = 0;
@@ -157,7 +158,8 @@ int ble_scheduler_connect_addresses(
 }
 
 int ble_scheduler_disconnect_addresses(
-    char addresses[][GATEWAY_MAX_ADDRESS_LEN],
+    const char *request_id,
+    const char addresses[][GATEWAY_MAX_ADDRESS_LEN],
     uint8_t address_count
 )
 {
@@ -165,8 +167,21 @@ int ble_scheduler_disconnect_addresses(
         return -1;
     }
 
+    memset(g_disconnect_request_id, 0, sizeof(g_disconnect_request_id));
+
+    if (request_id != NULL) {
+        strncpy(
+            g_disconnect_request_id,
+            request_id,
+            sizeof(g_disconnect_request_id) - 1
+        );
+    }
+
     for (uint8_t i = 0; i < address_count; i++) {
-        ble_interface_disconnect(addresses[i]);
+        int rc = ble_interface_disconnect(addresses[i]);
+        if (rc != 0) {
+            return rc;
+        }
     }
 
     return 0;
@@ -318,18 +333,24 @@ void ble_scheduler_on_disconnected(const char *address, int reason)
     }
 
     char line[192];
-        snprintf(
+    const char *request_id =
+    g_disconnect_request_id[0] != '\0'
+        ? g_disconnect_request_id
+        : g_connect_request_id;
+
+    snprintf(
         line,
         sizeof(line),
         "{\"type\":\"sensor_disconnected\","
         "\"request_id\":\"%s\","
         "\"address\":\"%s\","
         "\"reason\":%d}",
-        g_connect_request_id,
+        request_id,
         address != NULL ? address : "",
         reason
     );
     gateway_interface_send_json_line(line);
+    g_disconnect_request_id[0] = '\0';
 }
 
 void ble_scheduler_on_notification(
