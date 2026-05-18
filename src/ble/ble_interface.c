@@ -16,6 +16,16 @@ typedef struct {
     char name[32];
 } adv_parse_ctx_t;
 
+typedef struct {
+    bool used;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    bt_addr_le_t addr;
+} known_peer_t;
+
+#define BLE_MAX_DISCOVERED_PEERS 32
+
+static known_peer_t g_known_peers[BLE_MAX_DISCOVERED_PEERS];
+
 static bool parse_advertising_data(
     struct bt_data *data,
     void *user_data
@@ -40,6 +50,106 @@ static bool parse_advertising_data(
     return true;
 }
 
+static void format_address(
+    const bt_addr_le_t *addr,
+    char *out,
+    size_t out_size
+)
+{
+    if (addr == NULL || out == NULL || out_size == 0) {
+        return;
+    }
+
+    snprintf(
+        out,
+        out_size,
+        "%02X:%02X:%02X:%02X:%02X:%02X",
+        addr->a.val[5],
+        addr->a.val[4],
+        addr->a.val[3],
+        addr->a.val[2],
+        addr->a.val[1],
+        addr->a.val[0]
+    );
+}
+
+static known_peer_t *find_known_peer(const char *address)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(g_known_peers); i++) {
+        if (g_known_peers[i].used &&
+            strcmp(g_known_peers[i].address, address) == 0) {
+            return &g_known_peers[i];
+        }
+    }
+
+    return NULL;
+}
+
+static known_peer_t *upsert_known_peer(const bt_addr_le_t *addr)
+{
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    known_peer_t *free_slot = NULL;
+
+    format_address(addr, address, sizeof(address));
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_known_peers); i++) {
+        if (g_known_peers[i].used &&
+            strcmp(g_known_peers[i].address, address) == 0) {
+            g_known_peers[i].addr = *addr;
+            return &g_known_peers[i];
+        }
+
+        if (!g_known_peers[i].used && free_slot == NULL) {
+            free_slot = &g_known_peers[i];
+        }
+    }
+
+    if (free_slot == NULL) {
+        return NULL;
+    }
+
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->used = true;
+    free_slot->addr = *addr;
+    strncpy(free_slot->address, address, sizeof(free_slot->address) - 1);
+
+    return free_slot;
+}
+
+static void on_connected(struct bt_conn *conn, uint8_t err)
+{
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+
+    format_address(bt_conn_get_dst(conn), address, sizeof(address));
+
+    if (err != 0) {
+        if (g_callbacks.on_disconnected != NULL) {
+            g_callbacks.on_disconnected(address, -(int)err);
+        }
+        return;
+    }
+
+    if (g_callbacks.on_connected != NULL) {
+        g_callbacks.on_connected(address, (uint16_t)bt_conn_index(conn));
+    }
+}
+
+static void on_disconnected(struct bt_conn *conn, uint8_t reason)
+{
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+
+    format_address(bt_conn_get_dst(conn), address, sizeof(address));
+
+    if (g_callbacks.on_disconnected != NULL) {
+        g_callbacks.on_disconnected(address, (int)reason);
+    }
+}
+
+static struct bt_conn_cb g_conn_callbacks = {
+    .connected = on_connected,
+    .disconnected = on_disconnected,
+};
+
 static void device_found(
     const bt_addr_le_t *addr,
     int8_t rssi,
@@ -50,6 +160,11 @@ static void device_found(
     ARG_UNUSED(type);
 
     if (g_callbacks.on_sensor_found == NULL) {
+        return;
+    }
+
+    known_peer_t *peer = upsert_known_peer(addr);
+    if (peer == NULL) {
         return;
     }
 
@@ -96,6 +211,7 @@ int ble_interface_init(const ble_interface_callbacks_t *callbacks)
     }
 
     int rc = bt_enable(NULL);
+    bt_conn_cb_register(&g_conn_callbacks);
     if (rc != 0) {
         return rc;
     }
@@ -116,6 +232,8 @@ int ble_interface_start_scan(uint32_t timeout_ms)
     if (g_scanning) {
         return 0;
     }
+
+    memset(g_known_peers, 0, sizeof(g_known_peers));
 
     struct bt_le_scan_param scan_param = {
         .type = BT_LE_SCAN_TYPE_ACTIVE, //BT_LE_SCAN_TYPE_PASSIVE,
@@ -151,16 +269,40 @@ int ble_interface_stop_scan(void)
 
 int ble_interface_connect(const char *address)
 {
-    (void)address;
-    //(void)spec;
+    if (!g_ble_ready || address == NULL || address[0] == '\0') {
+        return -1;
+    }
+
+    known_peer_t *peer = find_known_peer(address);
+    if (peer == NULL) {
+        return -3;
+    }
+
+    if (g_scanning) {
+        int scan_rc = ble_interface_stop_scan();
+        if (scan_rc != 0) {
+            return scan_rc;
+        }
+    }
+
+    struct bt_conn *conn = NULL;
+
+    int rc = bt_conn_le_create(
+        &peer->addr,
+        BT_CONN_LE_CREATE_CONN,
+        BT_LE_CONN_PARAM_DEFAULT,
+        &conn
+    );
+
+    if (rc != 0) {
+        return rc;
+    }
 
     /*
-     * TODO:
-     * - create BLE connection
-     * - configure preferred connection params if possible
-     * - on success call g_callbacks.on_connected()
+     * Keep the connection object alive until callbacks are fully wired.
+     * For the single-connect milestone this is acceptable.
      */
-    return -2;
+    return 0;
 }
 
 int ble_interface_disconnect(const char *address)

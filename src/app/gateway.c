@@ -27,6 +27,7 @@ static void send_not_implemented(
 
 static void on_gateway_command(const gateway_command_t *command)
 {
+
     if (command == NULL) {
         return;
     }
@@ -51,9 +52,23 @@ static void on_gateway_command(const gateway_command_t *command)
         ble_scheduler_stop_scan();
         break;
 
-    case GW_CMD_CONNECT_ADDRESSES:
-        send_not_implemented(command, "connect_addresses");
+    case GW_CMD_CONNECT_ADDRESSES: {
+        int rc = ble_scheduler_connect_addresses(
+            request_id_or_null(command),
+            command->sensors,
+            command->sensor_count
+        );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "connect_addresses_failed",
+                rc
+            );
+        }
+
         break;
+    }
 
     case GW_CMD_DISCONNECT_ADDRESSES:
         send_not_implemented(command, "disconnect_addresses");

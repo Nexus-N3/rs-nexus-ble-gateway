@@ -35,7 +35,7 @@ static ble_scheduler_state_t g_state = SCHEDULER_STATE_IDLE;
 static char g_scan_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 static int64_t g_scan_deadline_ms;
 static bool g_scan_active;
-
+static char g_connect_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 static gateway_sensor_t g_sensors[GATEWAY_MAX_SENSORS];
 static uint8_t g_sensor_count = 0;
 
@@ -129,6 +129,7 @@ int ble_scheduler_stop_scan(void)
 }
 
 int ble_scheduler_connect_addresses(
+    const char *request_id,
     const gateway_connect_sensor_t *sensors,
     uint8_t sensor_count
 )
@@ -137,13 +138,22 @@ int ble_scheduler_connect_addresses(
         return -1;
     }
 
-    g_state = SCHEDULER_STATE_CONNECTING;
+    memset(g_connect_request_id, 0, sizeof(g_connect_request_id));
 
-    for (uint8_t i = 0; i < sensor_count; i++) {
-        ble_interface_connect(sensors[i].address);
+    if (request_id != NULL) {
+        strncpy(
+            g_connect_request_id,
+            request_id,
+            sizeof(g_connect_request_id) - 1
+        );
     }
 
-    return 0;
+    /*
+     * Smallest milestone:
+     * connect only the first requested address.
+     * Multi-sensor queue comes later.
+     */
+    return ble_interface_connect(sensors[0].address);
 }
 
 int ble_scheduler_disconnect_addresses(
@@ -283,25 +293,15 @@ void ble_scheduler_on_connected(const char *address, uint16_t conn_handle)
         sensor->is_connected = true;
     }
 
-    /*
-     * GATT discovery/subscription is intentionally disabled for the
-     * scan-only milestone. Re-enable when sensor specs are split into
-     * proper .h/.c files and connect/GATT becomes the active milestone.
-     *
-     * const sensor_spec_t *spec = sensor_spec_get(sensor->sensor_type);
-     * if (spec != NULL) {
-     *     ble_interface_discover_gatt(address, spec);
-     *     ble_interface_subscribe(address, spec->notify_characteristic_uuid);
-     *     sensor->state = SENSOR_STATE_READY;
-     * }
-     */
-
-    char line[160];
+    char line[224];
 
     snprintf(
         line,
         sizeof(line),
-        "{\"type\":\"sensor_connected\",\"address\":\"%s\"}",
+        "{\"type\":\"sensor_connected\","
+        "\"request_id\":\"%s\","
+        "\"address\":\"%s\"}",
+        g_connect_request_id,
         address != NULL ? address : ""
     );
 
@@ -318,11 +318,15 @@ void ble_scheduler_on_disconnected(const char *address, int reason)
     }
 
     char line[192];
-    snprintf(
+        snprintf(
         line,
         sizeof(line),
-        "{\"type\":\"sensor_disconnected\",\"address\":\"%s\",\"reason\":%d}",
-        address,
+        "{\"type\":\"sensor_disconnected\","
+        "\"request_id\":\"%s\","
+        "\"address\":\"%s\","
+        "\"reason\":%d}",
+        g_connect_request_id,
+        address != NULL ? address : "",
         reason
     );
     gateway_interface_send_json_line(line);

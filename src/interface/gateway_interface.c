@@ -166,6 +166,69 @@ static int json_type_is(const char *line, const char *type)
     return strstr(line, compact) != NULL || strstr(line, spaced) != NULL;
 }
 
+static void extract_address_array(
+    const char *line,
+    const char *field_name,
+    char out[][GATEWAY_MAX_ADDRESS_LEN],
+    uint8_t *out_count,
+    uint8_t max_count
+)
+{
+    char key[48];
+    const char *p;
+    uint8_t count = 0;
+
+    if (out_count == NULL || max_count == 0) {
+        return;
+    }
+
+    *out_count = 0;
+
+    snprintf(key, sizeof(key), "\"%s\"", field_name);
+
+    p = strstr(line, key);
+    if (p == NULL) {
+        return;
+    }
+
+    p = strchr(p, '[');
+    if (p == NULL) {
+        return;
+    }
+
+    p++;
+
+    while (*p != '\0' && *p != ']' && count < max_count) {
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            p++;
+        }
+
+        if (*p != '"') {
+            break;
+        }
+
+        p++;
+
+        const char *end = strchr(p, '"');
+        if (end == NULL) {
+            break;
+        }
+
+        size_t len = (size_t)(end - p);
+        if (len >= GATEWAY_MAX_ADDRESS_LEN) {
+            len = GATEWAY_MAX_ADDRESS_LEN - 1;
+        }
+
+        memcpy(out[count], p, len);
+        out[count][len] = '\0';
+
+        count++;
+        p = end + 1;
+    }
+
+    *out_count = count;
+}
+
 static void parse_command_line(const char *line, gateway_command_t *command)
 {
     memset(command, 0, sizeof(*command));
@@ -200,6 +263,25 @@ static void parse_command_line(const char *line, gateway_command_t *command)
 
     if (json_type_is(line, "connect_addresses")) {
         command->type = GW_CMD_CONNECT_ADDRESSES;
+
+        extract_address_array(
+            line,
+            "addresses",
+            command->addresses,
+            &command->address_count,
+            GATEWAY_MAX_SENSORS
+        );
+
+        command->sensor_count = command->address_count;
+
+        for (uint8_t i = 0; i < command->address_count; i++) {
+            strncpy(
+                command->sensors[i].address,
+                command->addresses[i],
+                sizeof(command->sensors[i].address) - 1
+            );
+        }
+
         return;
     }
 
