@@ -36,7 +36,12 @@ def disconnect_addresses(ser, address, timeout_s=10):
     deadline = time.time() + timeout_s
 
     while time.time() < deadline:
-        msg = read_json_any(ser, timeout_s=max(0.5, deadline - time.time()))
+        try:
+            msg = read_json_any(ser, timeout_s=max(0.5, deadline - time.time()))
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"Timed out waiting for disconnect confirmation for {address}"
+            ) from exc
         msg_type = msg.get("type")
 
         if msg_type == "sensor_disconnected" and msg.get("address") == address:
@@ -44,9 +49,15 @@ def disconnect_addresses(ser, address, timeout_s=10):
             return True
 
         if msg_type == "error" and msg.get("request_id") == request_id:
-            raise RuntimeError(
-                f"Gateway error {msg.get('error_code')}: {msg.get('message')}"
-            )
+            code = msg.get("error_code")
+            message = msg.get("message", "unknown_error")
+
+            if code == -3:
+                raise RuntimeError(
+                    f"Gateway could not disconnect {address}: sensor is not connected"
+                )
+
+            raise RuntimeError(f"Gateway disconnect failed for {address}: {message} ({code})")
 
         print("Ignoring JSON message:")
         print(json.dumps(msg, indent=2))
@@ -256,7 +267,13 @@ def connect_addresses(ser, addresses, timeout_s):
 
     deadline = time.time() + timeout_s
     while time.time() < deadline and pending:
-        msg = read_json_any(ser, timeout_s=max(0.1, deadline - time.time()))
+        try:
+            msg = read_json_any(ser, timeout_s=max(0.1, deadline - time.time()))
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"Timed out waiting for gateway response while connecting: "
+                f"{', '.join(pending)}"
+            ) from exc
         msg_type = msg.get("type")
 
         if msg_type == "sensor_connected" and msg.get("request_id") == request_id:
@@ -268,9 +285,17 @@ def connect_addresses(ser, addresses, timeout_s):
             continue
 
         if msg_type == "error" and msg.get("request_id") == request_id:
-            raise RuntimeError(
-                f"Gateway error {msg.get('error_code')}: {msg.get('message')}"
-            )
+            code = msg.get("error_code")
+            message = msg.get("message", "unknown_error")
+
+            if message == "sensor_not_found" or code == -3:
+                raise RuntimeError(
+                    "Gateway could not connect because one or more requested sensors "
+                    "were not found in the gateway's current discovery cache. "
+                    "Run without --skip-discover, rescan, or check the address."
+                )
+
+            raise RuntimeError(f"Gateway connect failed: {message} ({code})")
 
     if pending:
         raise TimeoutError(f"Timed out waiting for connections: {', '.join(pending)}")
@@ -441,7 +466,11 @@ def main():
     auto_connect_parser.set_defaults(func=run_auto_connect)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except (TimeoutError, RuntimeError) as exc:
+        print(f"ERROR: {exc}")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -62,7 +62,7 @@ static void on_gateway_command(const gateway_command_t *command)
         if (rc != 0) {
             gateway_interface_send_error(
                 request_id_or_null(command),
-                "connect_addresses_failed",
+                rc == -3 ? "sensor_not_found" : "connect_addresses_failed",
                 rc
             );
         }
