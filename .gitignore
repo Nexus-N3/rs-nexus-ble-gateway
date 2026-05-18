@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Local environment
+env.sh
+.env
+.env.*
+
+# Zephyr / west build outputs
+build/
+build_*/
+out/
+twister-out/
+ports/zephyr/build/
+
+# Zephyr generated/cache files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.elf
+*.hex
+*.bin
+*.map
+*.uf2
+*.lst
+*.dts
+*.config
+
+# Nordic / debug tooling
+JLink.log
+JLinkRTT.log
+RTT*
+*.jlink
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
