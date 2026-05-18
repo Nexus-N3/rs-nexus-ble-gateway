@@ -21,15 +21,18 @@ MOVELLA_UUID_HINTS = {
     "15172004-4947-11e9-8646-d663bd873d93",
 }
 
-def disconnect_addresses(ser, address, timeout_s=10):
+
+def disconnect_addresses(ser, addresses, timeout_s=10):
     request_id = f"disconnect_{int(time.time() * 1000)}"
+    pending = list(addresses)
+    disconnected = []
 
     send_jsonl(
         ser,
         {
             "type": "disconnect_addresses",
             "request_id": request_id,
-            "addresses": [address],
+            "addresses": pending,
         },
     )
 
@@ -40,13 +43,19 @@ def disconnect_addresses(ser, address, timeout_s=10):
             msg = read_json_any(ser, timeout_s=max(0.5, deadline - time.time()))
         except TimeoutError as exc:
             raise TimeoutError(
-                f"Timed out waiting for disconnect confirmation for {address}"
+                f"Timed out waiting for disconnect confirmation for: "
+                f"{', '.join(pending)}"
             ) from exc
         msg_type = msg.get("type")
 
-        if msg_type == "sensor_disconnected" and msg.get("address") == address:
-            print(f"DISCONNECTED: {address}")
-            return True
+        if msg_type == "sensor_disconnected" and msg.get("request_id") == request_id:
+            address = msg.get("address")
+            if address in pending:
+                pending.remove(address)
+                disconnected.append(address)
+                print(f"DISCONNECTED: {address}")
+            if not pending:
+                return disconnected
 
         if msg_type == "error" and msg.get("request_id") == request_id:
             code = msg.get("error_code")
@@ -54,15 +63,16 @@ def disconnect_addresses(ser, address, timeout_s=10):
 
             if code == -3:
                 raise RuntimeError(
-                    f"Gateway could not disconnect {address}: sensor is not connected"
+                    "Gateway could not disconnect one or more sensors because they "
+                    "are not connected."
                 )
 
-            raise RuntimeError(f"Gateway disconnect failed for {address}: {message} ({code})")
+            raise RuntimeError(f"Gateway disconnect failed: {message} ({code})")
 
         print("Ignoring JSON message:")
         print(json.dumps(msg, indent=2))
 
-    raise TimeoutError(f"Timed out waiting for disconnect of {address}")
+    raise TimeoutError(f"Timed out waiting for disconnect of: {', '.join(pending)}")
 
 
 def match_sensor_name(
@@ -200,7 +210,6 @@ def command_hello(ser):
 
 
 def discover_movella(ser, timeout_ms):
-    print("discover_movella: Starting scan...")
     request_id = f"scan_{int(time.time() * 1000)}"
     names_sorted = [MOVELLA_NAME]
     names_sorted_lower = [(MOVELLA_NAME, MOVELLA_NAME.lower())]
@@ -220,7 +229,6 @@ def discover_movella(ser, timeout_ms):
         msg_type = msg.get("type")
 
         if msg_type == "scan_result" and msg.get("request_id") == request_id:
-            print(msg)
             matched_name, matched_by = match_movella(
                 msg,
                 names_sorted,
@@ -251,56 +259,117 @@ def discover_movella(ser, timeout_ms):
             return list(matches.values())
 
 
-def connect_addresses(ser, addresses, timeout_s):
-    request_id = f"connect_{int(time.time() * 1000)}"
-    pending = list(addresses)
+def connect_addresses(
+    ser,
+    addresses,
+    attempt_timeout_s,
+    retry_attempts=1,
+    retry_delay_s=2.0,
+):
+    remaining = list(addresses)
     connected = []
 
-    send_jsonl(
-        ser,
-        {
-            "type": "connect_addresses",
-            "request_id": request_id,
-            "addresses": pending,
-        },
-    )
+    for attempt in range(retry_attempts + 1):
+        if not remaining:
+            break
 
-    deadline = time.time() + timeout_s
-    while time.time() < deadline and pending:
-        try:
-            msg = read_json_any(ser, timeout_s=max(0.1, deadline - time.time()))
-        except TimeoutError as exc:
-            raise TimeoutError(
-                f"Timed out waiting for gateway response while connecting: "
-                f"{', '.join(pending)}"
-            ) from exc
-        msg_type = msg.get("type")
+        request_id = f"connect_{int(time.time() * 1000)}_{attempt}"
+        pending = list(remaining)
+        failed_this_attempt = []
 
-        if msg_type == "sensor_connected" and msg.get("request_id") == request_id:
-            address = msg.get("address")
-            if address in pending:
-                pending.remove(address)
-                connected.append(address)
-                print(f"CONNECTED: {address}")
-            continue
+        send_jsonl(
+            ser,
+            {
+                "type": "connect_addresses",
+                "request_id": request_id,
+                "addresses": pending,
+            },
+        )
 
-        if msg_type == "error" and msg.get("request_id") == request_id:
-            code = msg.get("error_code")
-            message = msg.get("message", "unknown_error")
+        deadline = time.time() + attempt_timeout_s
+        while time.time() < deadline and pending:
+            try:
+                msg = read_json_any(ser, timeout_s=max(0.1, deadline - time.time()))
+            except TimeoutError:
+                break
 
-            if message == "sensor_not_found" or code == -3:
-                raise RuntimeError(
-                    "Gateway could not connect because one or more requested sensors "
-                    "were not found in the gateway's current discovery cache. "
-                    "Run without --skip-discover, rescan, or check the address."
-                )
+            msg_type = msg.get("type")
 
-            raise RuntimeError(f"Gateway connect failed: {message} ({code})")
+            if msg_type == "sensor_connected" and msg.get("request_id") == request_id:
+                address = msg.get("address")
+                if address in pending:
+                    pending.remove(address)
+                    if address not in connected:
+                        connected.append(address)
+                    print(f"CONNECTED: {address}")
+                continue
 
-    if pending:
-        raise TimeoutError(f"Timed out waiting for connections: {', '.join(pending)}")
+            if msg_type == "sensor_disconnected" and msg.get("request_id") == request_id:
+                address = msg.get("address")
+                if address in pending:
+                    pending.remove(address)
+                    failed_this_attempt.append(address)
+                    print(f"CONNECT FAILED: {address} reason={msg.get('reason')}")
+                continue
+
+            if msg_type == "error" and msg.get("request_id") == request_id:
+                code = msg.get("error_code")
+                message = msg.get("message", "unknown_error")
+
+                if message == "sensor_not_found" or code == -3:
+                    raise RuntimeError(
+                        "Gateway could not connect because one or more requested sensors "
+                        "were not found in the gateway's current discovery cache. "
+                        "Run without --skip-discover, rescan, or check the address."
+                    )
+
+                raise RuntimeError(f"Gateway connect failed: {message} ({code})")
+
+        remaining = failed_this_attempt + pending
+
+        if remaining and attempt < retry_attempts:
+            print(
+                f"Retrying in {retry_delay_s:.1f}s for addresses: {remaining}"
+            )
+            time.sleep(retry_delay_s)
+
+    if remaining:
+        raise TimeoutError(
+            f"Failed to connect after {retry_attempts + 1} attempt(s): "
+            f"{', '.join(remaining)}"
+        )
 
     return connected
+
+
+def select_discovered_addresses(matches, count):
+    if len(matches) < count:
+        raise RuntimeError(
+            f"Requested {count} Movella DOT sensors, found {len(matches)}"
+        )
+
+    return [entry["address"] for entry in matches[:count]]
+
+
+def add_connect_retry_args(parser):
+    parser.add_argument(
+        "--connect-attempt-timeout-s",
+        type=float,
+        default=2.0,
+        help="Seconds to wait for a connect attempt before retrying pending sensors.",
+    )
+    parser.add_argument(
+        "--connect-retry-attempts",
+        type=int,
+        default=1,
+        help="Number of retry attempts after the initial connect attempt.",
+    )
+    parser.add_argument(
+        "--connect-retry-delay-s",
+        type=float,
+        default=2.0,
+        help="Seconds to wait before retrying failed or pending connections.",
+    )
 
 
 def run_discover(args):
@@ -322,7 +391,13 @@ def run_connect(args):
                     "Requested addresses were not found in current Movella scan: "
                     + ", ".join(missing)
                 )
-        connected = connect_addresses(ser, args.address, timeout_s=args.timeout_s)
+        connected = connect_addresses(
+            ser,
+            args.address,
+            attempt_timeout_s=args.connect_attempt_timeout_s,
+            retry_attempts=args.connect_retry_attempts,
+            retry_delay_s=args.connect_retry_delay_s,
+        )
         print(json.dumps({"connected": connected}, indent=2))
 
 
@@ -330,14 +405,15 @@ def run_auto_connect(args):
     with open_gateway_serial(args.port) as ser:
         command_hello(ser)
         matches = discover_movella(ser, timeout_ms=args.timeout_ms)
-        if len(matches) < args.count:
-            raise RuntimeError(
-                f"Requested {args.count} Movella DOT sensors, found {len(matches)}"
-            )
-
-        selected = [entry["address"] for entry in matches[: args.count]]
+        selected = select_discovered_addresses(matches, args.count)
         print(f"AUTO-CONNECT addresses: {selected}")
-        connected = connect_addresses(ser, selected, timeout_s=args.connect_timeout_s)
+        connected = connect_addresses(
+            ser,
+            selected,
+            attempt_timeout_s=args.connect_attempt_timeout_s,
+            retry_attempts=args.connect_retry_attempts,
+            retry_delay_s=args.connect_retry_delay_s,
+        )
         print(
             json.dumps(
                 {
@@ -348,6 +424,7 @@ def run_auto_connect(args):
                 indent=2,
             )
         )
+
 
 def run_connect_disconnect(args):
     with open_gateway_serial(args.port) as ser:
@@ -369,7 +446,9 @@ def run_connect_disconnect(args):
         connected = connect_addresses(
             ser,
             addresses,
-            timeout_s=args.timeout_s,
+            attempt_timeout_s=args.connect_attempt_timeout_s,
+            retry_attempts=args.connect_retry_attempts,
+            retry_delay_s=args.connect_retry_delay_s,
         )
 
         if not connected:
@@ -378,20 +457,53 @@ def run_connect_disconnect(args):
         print(f"Waiting {args.hold_s:.1f} seconds before disconnect...")
         time.sleep(args.hold_s)
 
-        disconnected = []
-
-        for address in connected:
-            if disconnect_addresses(
-                ser,
-                address,
-                timeout_s=args.timeout_s,
-            ):
-                disconnected.append(address)
+        disconnected = disconnect_addresses(
+            ser,
+            connected,
+            timeout_s=args.timeout_s,
+        )
 
         print(
             json.dumps(
                 {
                     "connected_then_disconnected": disconnected,
+                },
+                indent=2,
+            )
+        )
+
+
+def run_auto_connect_disconnect(args):
+    with open_gateway_serial(args.port) as ser:
+        command_hello(ser)
+        matches = discover_movella(ser, timeout_ms=args.timeout_ms)
+        selected = select_discovered_addresses(matches, args.count)
+
+        print(f"AUTO-CONNECT-DISCONNECT addresses: {selected}")
+        connected = connect_addresses(
+            ser,
+            selected,
+            attempt_timeout_s=args.connect_attempt_timeout_s,
+            retry_attempts=args.connect_retry_attempts,
+            retry_delay_s=args.connect_retry_delay_s,
+        )
+
+        print(f"Waiting {args.hold_s:.1f} seconds before disconnect...")
+        time.sleep(args.hold_s)
+
+        disconnected = disconnect_addresses(
+            ser,
+            connected,
+            timeout_s=args.disconnect_timeout_s,
+        )
+
+        print(
+            json.dumps(
+                {
+                    "matched": matches,
+                    "selected": selected,
+                    "connected": connected,
+                    "disconnected": disconnected,
                 },
                 indent=2,
             )
@@ -428,7 +540,7 @@ def main():
         action="store_true",
         help="Skip the pre-connect discovery pass.",
     )
-    connect_parser.add_argument("--timeout-s", type=float, default=30.0)
+    add_connect_retry_args(connect_parser)
     connect_parser.set_defaults(func=run_connect)
 
     connect_disconnect_parser = subparsers.add_parser(
@@ -447,6 +559,7 @@ def main():
         action="store_true",
         help="Skip the pre-connect discovery pass.",
     )
+    add_connect_retry_args(connect_disconnect_parser)
     connect_disconnect_parser.add_argument("--timeout-s", type=float, default=30.0)
     connect_disconnect_parser.add_argument(
         "--hold-s",
@@ -462,8 +575,28 @@ def main():
     )
     auto_connect_parser.add_argument("--count", type=int, required=True)
     auto_connect_parser.add_argument("--timeout-ms", type=int, default=5000)
-    auto_connect_parser.add_argument("--connect-timeout-s", type=float, default=30.0)
+    add_connect_retry_args(auto_connect_parser)
     auto_connect_parser.set_defaults(func=run_auto_connect)
+
+    auto_connect_disconnect_parser = subparsers.add_parser(
+        "auto-connect-disconnect",
+        help="Scan for Movella DOT sensors, connect the first N matches, then disconnect them.",
+    )
+    auto_connect_disconnect_parser.add_argument("--count", type=int, required=True)
+    auto_connect_disconnect_parser.add_argument("--timeout-ms", type=int, default=5000)
+    add_connect_retry_args(auto_connect_disconnect_parser)
+    auto_connect_disconnect_parser.add_argument(
+        "--disconnect-timeout-s",
+        type=float,
+        default=30.0,
+    )
+    auto_connect_disconnect_parser.add_argument(
+        "--hold-s",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after connecting before disconnecting.",
+    )
+    auto_connect_disconnect_parser.set_defaults(func=run_auto_connect_disconnect)
 
     args = parser.parse_args()
     try:

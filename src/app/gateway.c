@@ -105,7 +105,13 @@ static void on_gateway_command(const gateway_command_t *command)
         break;
 
     case GW_CMD_DISCONNECT_ALL:
-        send_not_implemented(command, "disconnect_all");
+        if (ble_scheduler_disconnect_all() != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "disconnect_all_failed",
+                -1
+            );
+        }
         break;
 
     default:

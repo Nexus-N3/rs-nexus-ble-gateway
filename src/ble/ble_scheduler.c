@@ -37,6 +37,10 @@ static bool g_scan_active;
 static char g_scan_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 static char g_disconnect_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 static char g_connect_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
+static char g_connect_queue[GATEWAY_MAX_SENSORS][GATEWAY_MAX_ADDRESS_LEN];
+static uint8_t g_connect_queue_count;
+static uint8_t g_connect_queue_index;
+static uint8_t g_disconnect_pending_count;
 static gateway_sensor_t g_sensors[GATEWAY_MAX_SENSORS];
 static uint8_t g_sensor_count = 0;
 
@@ -84,10 +88,67 @@ static gateway_sensor_t *allocate_sensor(const ble_discovered_sensor_t *found)
     return sensor;
 }
 
+static gateway_sensor_t *ensure_sensor_by_address(const char *address)
+{
+    gateway_sensor_t *existing;
+
+    if (address == NULL || address[0] == '\0') {
+        return NULL;
+    }
+
+    existing = find_sensor_by_address(address);
+    if (existing != NULL) {
+        return existing;
+    }
+
+    if (g_sensor_count >= GATEWAY_MAX_SENSORS) {
+        return NULL;
+    }
+
+    existing = &g_sensors[g_sensor_count++];
+    memset(existing, 0, sizeof(*existing));
+    strncpy(existing->address, address, sizeof(existing->address) - 1);
+    existing->state = SENSOR_STATE_IDLE;
+    existing->expected_rate_hz = GATEWAY_DEFAULT_STREAM_RATE_HZ;
+    existing->is_required = true;
+    return existing;
+}
+
+static int start_next_connect(void)
+{
+    int rc;
+
+    if (g_connect_queue_index >= g_connect_queue_count) {
+        g_state = SCHEDULER_STATE_READY;
+        g_connect_queue_count = 0;
+        g_connect_queue_index = 0;
+        return 0;
+    }
+
+    g_state = SCHEDULER_STATE_CONNECTING;
+    rc = ble_interface_connect(g_connect_queue[g_connect_queue_index]);
+    if (rc != 0) {
+        g_state = SCHEDULER_STATE_FAILED;
+        gateway_interface_send_error(
+            g_connect_request_id[0] != '\0' ? g_connect_request_id : NULL,
+            rc == -3 ? "sensor_not_found" : "connect_failed",
+            rc
+        );
+        g_connect_queue_count = 0;
+        g_connect_queue_index = 0;
+        return rc;
+    }
+
+    return 0;
+}
+
 int ble_scheduler_init(void)
 {
     memset(g_sensors, 0, sizeof(g_sensors));
     g_sensor_count = 0;
+    g_connect_queue_count = 0;
+    g_connect_queue_index = 0;
+    g_disconnect_pending_count = 0;
     g_state = SCHEDULER_STATE_IDLE;
     return 0;
 }
@@ -149,12 +210,28 @@ int ble_scheduler_connect_addresses(
         );
     }
 
-    /*
-     * Smallest milestone:
-     * connect only the first requested address.
-     * Multi-sensor queue comes later.
-     */
-    return ble_interface_connect(sensors[0].address);
+    g_connect_queue_count = 0;
+    g_connect_queue_index = 0;
+
+    for (uint8_t i = 0; i < sensor_count && i < GATEWAY_MAX_SENSORS; i++) {
+        if (sensors[i].address[0] == '\0') {
+            return -1;
+        }
+
+        strncpy(
+            g_connect_queue[g_connect_queue_count],
+            sensors[i].address,
+            sizeof(g_connect_queue[g_connect_queue_count]) - 1
+        );
+        ensure_sensor_by_address(sensors[i].address);
+        g_connect_queue_count++;
+    }
+
+    if (g_connect_queue_count == 0) {
+        return -1;
+    }
+
+    return start_next_connect();
 }
 
 int ble_scheduler_disconnect_addresses(
@@ -177,9 +254,12 @@ int ble_scheduler_disconnect_addresses(
         );
     }
 
+    g_disconnect_pending_count = address_count;
+
     for (uint8_t i = 0; i < address_count; i++) {
         int rc = ble_interface_disconnect(addresses[i]);
         if (rc != 0) {
+            g_disconnect_pending_count = 0;
             return rc;
         }
     }
@@ -263,6 +343,7 @@ int ble_scheduler_disconnect_all(void)
         }
     }
 
+    g_disconnect_pending_count = 0;
     g_state = SCHEDULER_STATE_IDLE;
     return 0;
 }
@@ -290,6 +371,12 @@ void ble_scheduler_on_sensor_found(const ble_discovered_sensor_t *found)
         return;
     }
 
+    gateway_sensor_t *sensor = allocate_sensor(found);
+    if (sensor != NULL) {
+        sensor->rssi = found->rssi;
+        sensor->state = SENSOR_STATE_FOUND;
+    }
+
     gateway_interface_send_scan_result(
         g_scan_request_id,
         found->address,
@@ -300,7 +387,7 @@ void ble_scheduler_on_sensor_found(const ble_discovered_sensor_t *found)
 
 void ble_scheduler_on_connected(const char *address, uint16_t conn_handle)
 {
-    gateway_sensor_t *sensor = find_sensor_by_address(address);
+    gateway_sensor_t *sensor = ensure_sensor_by_address(address);
 
     if (sensor != NULL) {
         sensor->conn_handle = conn_handle;
@@ -321,6 +408,13 @@ void ble_scheduler_on_connected(const char *address, uint16_t conn_handle)
     );
 
     gateway_interface_send_json_line(line);
+
+    if (g_connect_queue_count > 0 &&
+        g_connect_queue_index < g_connect_queue_count &&
+        strcmp(g_connect_queue[g_connect_queue_index], address) == 0) {
+        g_connect_queue_index++;
+        start_next_connect();
+    }
 }
 
 void ble_scheduler_on_disconnected(const char *address, int reason)
@@ -350,7 +444,20 @@ void ble_scheduler_on_disconnected(const char *address, int reason)
         reason
     );
     gateway_interface_send_json_line(line);
-    g_disconnect_request_id[0] = '\0';
+
+    if (g_disconnect_pending_count > 0) {
+        g_disconnect_pending_count--;
+        if (g_disconnect_pending_count == 0) {
+            g_disconnect_request_id[0] = '\0';
+        }
+    } else if (g_connect_queue_count > 0 &&
+               g_connect_queue_index < g_connect_queue_count &&
+               strcmp(g_connect_queue[g_connect_queue_index], address) == 0) {
+        g_connect_queue_index++;
+        start_next_connect();
+    } else {
+        g_disconnect_request_id[0] = '\0';
+    }
 }
 
 void ble_scheduler_on_notification(
