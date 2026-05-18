@@ -47,7 +47,9 @@ int gateway_interface_send_scan_result(
     const char *request_id,
     const char *address,
     const char *name,
-    int rssi
+    int rssi,
+    const char service_uuids[][GATEWAY_MAX_UUID_LEN],
+    uint8_t service_uuid_count
 );
 
 int gateway_interface_send_scan_complete(const char *request_id);

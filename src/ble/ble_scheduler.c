@@ -24,7 +24,6 @@ buffering
 */
 #include "ble_scheduler.h"
 #include "ble_interface.h"
-#include "../sensors/sensor_spec.h"
 #include "../interface/gateway_interface.h"
 #include "../config/gateway_config.h"
 #include <string.h>
@@ -38,6 +37,10 @@ static bool g_scan_active;
 
 static gateway_sensor_t g_sensors[GATEWAY_MAX_SENSORS];
 static uint8_t g_sensor_count = 0;
+static gateway_connect_sensor_t g_connect_queue[GATEWAY_MAX_SENSORS];
+static uint8_t g_connect_queue_count;
+static uint8_t g_connect_queue_index;
+static char g_connect_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 
 static ble_scheduler_policy_t g_policy = {
     .max_parallel_connects = 1,
@@ -83,18 +86,30 @@ static gateway_sensor_t *allocate_sensor(const ble_discovered_sensor_t *found)
     return sensor;
 }
 
+static int start_next_connect(void)
+{
+    if (g_connect_queue_index >= g_connect_queue_count) {
+        g_state = SCHEDULER_STATE_IDLE;
+        return 0;
+    }
+
+    return ble_interface_connect(g_connect_queue[g_connect_queue_index].address);
+}
+
 int ble_scheduler_init(void)
 {
     memset(g_sensors, 0, sizeof(g_sensors));
+    memset(g_connect_queue, 0, sizeof(g_connect_queue));
     g_sensor_count = 0;
+    g_connect_queue_count = 0;
+    g_connect_queue_index = 0;
+    g_connect_request_id[0] = '\0';
     g_state = SCHEDULER_STATE_IDLE;
     return 0;
 }
 
 int ble_scheduler_start_scan(const char *request_id, uint32_t timeout_ms)
 {
-    g_state = SCHEDULER_STATE_DISCOVERING;
-
     if (timeout_ms == 0) {
         timeout_ms = GATEWAY_DEFAULT_SCAN_TIMEOUT_MS;
     }
@@ -109,26 +124,62 @@ int ble_scheduler_start_scan(const char *request_id, uint32_t timeout_ms)
         );
     }
 
+    int rc = ble_interface_start_scan(timeout_ms);
+    if (rc != 0) {
+        g_scan_active = false;
+        g_state = SCHEDULER_STATE_FAILED;
+        gateway_interface_send_error(
+            g_scan_request_id,
+            "ble_interface_start_scan_failed",
+            rc
+        );
+        return rc;
+    }
+
+    g_state = SCHEDULER_STATE_DISCOVERING;
     g_scan_deadline_ms = k_uptime_get() + timeout_ms;
     g_scan_active = true;
 
-    return ble_interface_start_scan(NULL, timeout_ms);
+    char line[128];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"scan_started\",\"request_id\":\"%s\"}",
+        g_scan_request_id
+    );
+
+    gateway_interface_send_json_line(line);
+
+    return 0;
 }
 
 int ble_scheduler_stop_scan(void)
 {
+    if (!g_scan_active) {
+        return 0;
+    }
+
+    g_scan_active = false;
+    g_state = SCHEDULER_STATE_IDLE;
+
     int rc = ble_interface_stop_scan();
 
-    if (g_scan_active) {
-        g_scan_active = false;
-        g_state = SCHEDULER_STATE_IDLE;
-        gateway_interface_send_scan_complete(g_scan_request_id);
+    gateway_interface_send_scan_complete(g_scan_request_id);
+
+    if (rc != 0) {
+        gateway_interface_send_error(
+            g_scan_request_id,
+            "ble_interface_stop_scan_failed",
+            rc
+        );
     }
 
     return rc;
 }
 
 int ble_scheduler_connect_addresses(
+    const char *request_id,
     const gateway_connect_sensor_t *sensors,
     uint8_t sensor_count
 )
@@ -137,13 +188,29 @@ int ble_scheduler_connect_addresses(
         return -1;
     }
 
-    g_state = SCHEDULER_STATE_CONNECTING;
-
-    for (uint8_t i = 0; i < sensor_count; i++) {
-        ble_interface_connect(sensors[i].address, NULL);
+    if (sensor_count > GATEWAY_MAX_SENSORS) {
+        return -2;
     }
 
-    return 0;
+    g_state = SCHEDULER_STATE_CONNECTING;
+    memset(g_connect_queue, 0, sizeof(g_connect_queue));
+    g_connect_queue_count = sensor_count;
+    g_connect_queue_index = 0;
+    memset(g_connect_request_id, 0, sizeof(g_connect_request_id));
+
+    if (request_id != NULL) {
+        strncpy(
+            g_connect_request_id,
+            request_id,
+            sizeof(g_connect_request_id) - 1
+        );
+    }
+
+    for (uint8_t i = 0; i < sensor_count; i++) {
+        g_connect_queue[i] = sensors[i];
+    }
+
+    return start_next_connect();
 }
 
 int ble_scheduler_disconnect_addresses(
@@ -255,6 +322,7 @@ int ble_scheduler_get_status(void)
 void ble_scheduler_tick(void)
 {
     if (g_scan_active && k_uptime_get() >= g_scan_deadline_ms) {
+        gateway_interface_send_json_line("{\"type\":\"scan_timeout_reached\"}");
         ble_scheduler_stop_scan();
     }
 }
@@ -265,11 +333,21 @@ void ble_scheduler_on_sensor_found(const ble_discovered_sensor_t *found)
         return;
     }
 
+    gateway_sensor_t *sensor = allocate_sensor(found);
+    if (sensor == NULL) {
+        return;
+    }
+
+    sensor->rssi = found->rssi;
+    sensor->state = SENSOR_STATE_FOUND;
+
     gateway_interface_send_scan_result(
         g_scan_request_id,
         found->address,
         found->name,
-        found->rssi
+        found->rssi,
+        found->service_uuids,
+        found->service_uuid_count
     );
 }
 
@@ -283,29 +361,31 @@ void ble_scheduler_on_connected(const char *address, uint16_t conn_handle)
         sensor->is_connected = true;
     }
 
-    /*
-     * GATT discovery/subscription is intentionally disabled for the
-     * scan-only milestone. Re-enable when sensor specs are split into
-     * proper .h/.c files and connect/GATT becomes the active milestone.
-     *
-     * const sensor_spec_t *spec = sensor_spec_get(sensor->sensor_type);
-     * if (spec != NULL) {
-     *     ble_interface_discover_gatt(address, spec);
-     *     ble_interface_subscribe(address, spec->notify_characteristic_uuid);
-     *     sensor->state = SENSOR_STATE_READY;
-     * }
-     */
-
-    char line[160];
+    char line[224];
 
     snprintf(
         line,
         sizeof(line),
-        "{\"type\":\"sensor_connected\",\"address\":\"%s\"}",
+        "{\"type\":\"sensor_connected\",\"request_id\":\"%s\",\"address\":\"%s\"}",
+        g_connect_request_id,
         address != NULL ? address : ""
     );
 
     gateway_interface_send_json_line(line);
+
+    if (g_state == SCHEDULER_STATE_CONNECTING &&
+        g_connect_queue_index < g_connect_queue_count) {
+        g_connect_queue_index++;
+        int rc = start_next_connect();
+        if (rc != 0) {
+            gateway_interface_send_error(
+                g_connect_request_id,
+                "connect_failed",
+                rc
+            );
+            g_state = SCHEDULER_STATE_FAILED;
+        }
+    }
 }
 
 void ble_scheduler_on_disconnected(const char *address, int reason)
@@ -326,6 +406,27 @@ void ble_scheduler_on_disconnected(const char *address, int reason)
         reason
     );
     gateway_interface_send_json_line(line);
+
+    if (g_state == SCHEDULER_STATE_CONNECTING &&
+        g_connect_queue_index < g_connect_queue_count &&
+        address != NULL &&
+        strcmp(address, g_connect_queue[g_connect_queue_index].address) == 0) {
+        gateway_interface_send_error(
+            g_connect_request_id,
+            "connect_failed",
+            reason
+        );
+        g_connect_queue_index++;
+        int rc = start_next_connect();
+        if (rc != 0) {
+            gateway_interface_send_error(
+                g_connect_request_id,
+                "connect_failed",
+                rc
+            );
+            g_state = SCHEDULER_STATE_FAILED;
+        }
+    }
 }
 
 void ble_scheduler_on_notification(

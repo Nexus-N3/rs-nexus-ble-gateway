@@ -10,7 +10,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
-#define RX_LINE_MAX 256
+#define RX_LINE_MAX 1024
 
 static const struct device *uart_dev =
     DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
@@ -38,12 +38,15 @@ int gateway_interface_send_scan_result(
     const char *request_id,
     const char *address,
     const char *name,
-    int rssi
+    int rssi,
+    const char service_uuids[][GATEWAY_MAX_UUID_LEN],
+    uint8_t service_uuid_count
 )
 {
-    char line[256];
+    char line[512];
+    size_t offset;
 
-    snprintf(
+    offset = (size_t)snprintf(
         line,
         sizeof(line),
         "{\"type\":\"scan_result\","
@@ -51,12 +54,28 @@ int gateway_interface_send_scan_result(
         "\"address\":\"%s\","
         "\"name\":\"%s\","
         "\"rssi\":%d,"
-        "\"service_uuids\":[]}",
+        "\"service_uuids\":[",
         request_id != NULL ? request_id : "",
         address != NULL ? address : "",
         name != NULL ? name : "",
         rssi
     );
+
+    for (uint8_t i = 0; i < service_uuid_count && offset < sizeof(line); i++) {
+        offset += (size_t)snprintf(
+            line + offset,
+            sizeof(line) - offset,
+            "%s\"%s\"",
+            i == 0 ? "" : ",",
+            service_uuids[i]
+        );
+    }
+
+    if (offset < sizeof(line)) {
+        snprintf(line + offset, sizeof(line) - offset, "]}");
+    } else {
+        line[sizeof(line) - 1] = '\0';
+    }
 
     return gateway_interface_send_json_line(line);
 }
@@ -155,6 +174,66 @@ static void extract_request_id(const char *line, char *out, size_t out_size)
     out[len] = '\0';
 }
 
+static void extract_address_array(
+    const char *line,
+    const char *field_name,
+    char out[][GATEWAY_MAX_ADDRESS_LEN],
+    uint8_t *out_count,
+    uint8_t max_count
+)
+{
+    char key[48];
+    const char *p;
+    uint8_t count = 0;
+
+    if (out_count == NULL || max_count == 0) {
+        return;
+    }
+
+    *out_count = 0;
+
+    snprintf(key, sizeof(key), "\"%s\"", field_name);
+    p = strstr(line, key);
+    if (p == NULL) {
+        return;
+    }
+
+    p = strchr(p, '[');
+    if (p == NULL) {
+        return;
+    }
+
+    p++;
+
+    while (*p != '\0' && *p != ']' && count < max_count) {
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            p++;
+        }
+
+        if (*p != '"') {
+            break;
+        }
+
+        p++;
+        const char *end = strchr(p, '"');
+        if (end == NULL) {
+            break;
+        }
+
+        size_t len = (size_t)(end - p);
+        if (len >= GATEWAY_MAX_ADDRESS_LEN) {
+            len = GATEWAY_MAX_ADDRESS_LEN - 1;
+        }
+
+        memcpy(out[count], p, len);
+        out[count][len] = '\0';
+        count++;
+        p = end + 1;
+    }
+
+    *out_count = count;
+}
+
 static int json_type_is(const char *line, const char *type)
 {
     char compact[64];
@@ -200,6 +279,22 @@ static void parse_command_line(const char *line, gateway_command_t *command)
 
     if (json_type_is(line, "connect_addresses")) {
         command->type = GW_CMD_CONNECT_ADDRESSES;
+        extract_address_array(
+            line,
+            "addresses",
+            command->addresses,
+            &command->address_count,
+            GATEWAY_MAX_SENSORS
+        );
+
+        command->sensor_count = command->address_count;
+        for (uint8_t i = 0; i < command->address_count; i++) {
+            strncpy(
+                command->sensors[i].address,
+                command->addresses[i],
+                sizeof(command->sensors[i].address) - 1
+            );
+        }
         return;
     }
 

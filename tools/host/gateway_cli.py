@@ -50,7 +50,7 @@ def read_json_any(ser, timeout_s=10):
         json_text = line[start : end + 1]
 
         try:
-            return json.loads(line)
+            return json.loads(json_text)
         except json.JSONDecodeError:
             continue
 
@@ -91,7 +91,7 @@ def read_json_until(ser, wanted_type, request_id=None, timeout_s=10):
         json_text = line[start : end + 1]
 
         try:
-            msg = json.loads(line)
+            msg = json.loads(json_text)
         except json.JSONDecodeError:
             continue
 

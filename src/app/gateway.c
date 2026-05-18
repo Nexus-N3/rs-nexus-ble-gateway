@@ -4,6 +4,7 @@
 #include "../ble/ble_scheduler.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
 static const char *request_id_or_null(const gateway_command_t *command)
 {
@@ -40,20 +41,57 @@ static void on_gateway_command(const gateway_command_t *command)
         gateway_interface_send_status(request_id_or_null(command));
         break;
 
-    case GW_CMD_SCAN_START:
-        ble_scheduler_start_scan(
+    case GW_CMD_SCAN_START: {
+        char line[128];
+
+        snprintf(
+            line,
+            sizeof(line),
+            "{\"type\":\"scan_start_received\","
+            "\"request_id\":\"%s\","
+            "\"timeout_ms\":%u}",
+            request_id_or_null(command) != NULL ? request_id_or_null(command) : "",
+            command->timeout_ms
+        );
+
+        gateway_interface_send_json_line(line);
+
+        int rc = ble_scheduler_start_scan(
             request_id_or_null(command),
             command->timeout_ms
         );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "scan_start_failed",
+                rc
+            );
+        }
+
         break;
+    }
 
     case GW_CMD_SCAN_STOP:
         ble_scheduler_stop_scan();
         break;
 
     case GW_CMD_CONNECT_ADDRESSES:
-        send_not_implemented(command, "connect_addresses");
+    {
+        int rc = ble_scheduler_connect_addresses(
+            request_id_or_null(command),
+            command->sensors,
+            command->sensor_count
+        );
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "connect_addresses_failed",
+                rc
+            );
+        }
         break;
+    }
 
     case GW_CMD_DISCONNECT_ADDRESSES:
         send_not_implemented(command, "disconnect_addresses");
