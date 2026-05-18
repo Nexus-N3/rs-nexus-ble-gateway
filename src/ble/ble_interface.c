@@ -118,8 +118,9 @@ int ble_interface_start_scan(uint32_t timeout_ms)
     }
 
     struct bt_le_scan_param scan_param = {
-        .type = BT_LE_SCAN_TYPE_PASSIVE,
-        .options = BT_LE_SCAN_OPT_NONE,
+        .type = BT_LE_SCAN_TYPE_ACTIVE, //BT_LE_SCAN_TYPE_PASSIVE,
+        .options = BT_LE_SCAN_OPT_FILTER_DUPLICATE,
+        //.options = BT_LE_SCAN_OPT_NONE,
         .interval = BT_GAP_SCAN_FAST_INTERVAL,
         .window = BT_GAP_SCAN_FAST_WINDOW,
     };
