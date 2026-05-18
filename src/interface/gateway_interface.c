@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 #define RX_LINE_MAX 256
 
@@ -31,6 +32,78 @@ static void transport_write_str(const char *s)
     while (*s != '\0') {
         uart_poll_out(uart_dev, *s++);
     }
+}
+
+int gateway_interface_send_scan_result(
+    const char *request_id,
+    const char *address,
+    const char *name,
+    int rssi
+)
+{
+    char line[256];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"scan_result\","
+        "\"request_id\":\"%s\","
+        "\"address\":\"%s\","
+        "\"name\":\"%s\","
+        "\"rssi\":%d,"
+        "\"service_uuids\":[]}",
+        request_id != NULL ? request_id : "",
+        address != NULL ? address : "",
+        name != NULL ? name : "",
+        rssi
+    );
+
+    return gateway_interface_send_json_line(line);
+}
+
+int gateway_interface_send_scan_complete(const char *request_id)
+{
+    char line[128];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"scan_complete\","
+        "\"request_id\":\"%s\"}",
+        request_id != NULL ? request_id : ""
+    );
+
+    return gateway_interface_send_json_line(line);
+}
+
+static uint32_t extract_uint32_field(
+    const char *line,
+    const char *field_name,
+    uint32_t default_value
+)
+{
+    char key[48];
+    const char *p;
+
+    snprintf(key, sizeof(key), "\"%s\"", field_name);
+
+    p = strstr(line, key);
+    if (p == NULL) {
+        return default_value;
+    }
+
+    p = strchr(p, ':');
+    if (p == NULL) {
+        return default_value;
+    }
+
+    p++;
+
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    return (uint32_t)strtoul(p, NULL, 10);
 }
 
 static void extract_request_id(const char *line, char *out, size_t out_size)
@@ -112,6 +185,11 @@ static void parse_command_line(const char *line, gateway_command_t *command)
 
     if (json_type_is(line, "scan_start")) {
         command->type = GW_CMD_SCAN_START;
+        command->timeout_ms = extract_uint32_field(
+            line,
+            "timeout_ms",
+            5000
+        );
         return;
     }
 

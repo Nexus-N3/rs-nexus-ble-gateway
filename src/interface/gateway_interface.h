@@ -42,3 +42,12 @@ int gateway_interface_send_not_implemented(
  * Production should move to structured event serialization or binary framing.
  */
 int gateway_interface_send_json_line(const char *json);
+
+int gateway_interface_send_scan_result(
+    const char *request_id,
+    const char *address,
+    const char *name,
+    int rssi
+);
+
+int gateway_interface_send_scan_complete(const char *request_id);

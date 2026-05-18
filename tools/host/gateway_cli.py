@@ -16,6 +16,46 @@ def send_jsonl(ser, obj):
     ser.write(line.encode("utf-8"))
     ser.flush()
 
+def read_json_any(ser, timeout_s=10):
+    deadline = time.time() + timeout_s
+    line_buf = bytearray()
+
+    while time.time() < deadline:
+        b = ser.read(1)
+
+        if not b:
+            continue
+
+        if b == b"\r":
+            continue
+
+        if b != b"\n":
+            line_buf.extend(b)
+            continue
+
+        line = line_buf.decode("utf-8", errors="replace").strip()
+        line_buf.clear()
+
+        if not line:
+            continue
+
+        print("BOARD <-", line)
+
+        start = line.find("{")
+        end = line.rfind("}")
+
+        if start == -1 or end == -1 or end <= start:
+            continue
+
+        json_text = line[start : end + 1]
+
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+    raise TimeoutError("Timed out waiting for JSON")
+
 
 def read_json_until(ser, wanted_type, request_id=None, timeout_s=10):
     deadline = time.time() + timeout_s
@@ -42,8 +82,13 @@ def read_json_until(ser, wanted_type, request_id=None, timeout_s=10):
 
         print("BOARD <-", line)
 
-        if not line.startswith("{"):
+        start = line.find("{")
+        end = line.rfind("}")
+
+        if start == -1 or end == -1 or end <= start:
             continue
+
+        json_text = line[start : end + 1]
 
         try:
             msg = json.loads(line)
@@ -123,6 +168,34 @@ def command_status(ser):
     print("PASS: get_status")
     print(json.dumps(msg, indent=2))
 
+def command_scan(ser):
+    request_id = "scan_001"
+
+    send_jsonl(
+        ser,
+        {
+            "type": "scan_start",
+            "request_id": request_id,
+            "timeout_ms": 5000,
+        },
+    )
+
+    while True:
+        msg = read_json_any(ser, timeout_s=10)
+        msg_type = msg.get("type")
+
+        if msg_type == "scan_result":
+            print("SCAN:")
+            print(json.dumps(msg, indent=2))
+            continue
+
+        if msg_type == "scan_complete":
+            print("PASS: scan_complete")
+            print(json.dumps(msg, indent=2))
+            return
+
+        print("Ignoring JSON message:")
+        print(json.dumps(msg, indent=2))
 
 def main():
     parser = argparse.ArgumentParser(
@@ -132,7 +205,7 @@ def main():
         "command",
         nargs="?",
         default="hello",
-        choices=["hello", "status", "all"],
+        choices=["hello", "status", "scan", "all"],
         help="Command to run.",
     )
     parser.add_argument(
@@ -148,9 +221,12 @@ def main():
             command_hello(ser)
         elif args.command == "status":
             command_status(ser)
+        elif args.command == "scan":
+            command_scan(ser)
         elif args.command == "all":
             command_hello(ser)
             command_status(ser)
+            command_scan(ser)
 
 
 if __name__ == "__main__":

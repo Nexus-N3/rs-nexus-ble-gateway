@@ -7,6 +7,8 @@ target_sources(app PRIVATE
   ../../src/main.c
   ../../src/app/gateway.c
   ../../src/interface/gateway_interface.c
+  ../../src/ble/ble_interface.c
+  ../../src/ble/ble_scheduler.c
 )
 
 target_include_directories(app PRIVATE
@@ -15,4 +17,5 @@ target_include_directories(app PRIVATE
   ../../src/interface
   ../../src/ble
   ../../src/config
+  ../../src/sensors
 )
