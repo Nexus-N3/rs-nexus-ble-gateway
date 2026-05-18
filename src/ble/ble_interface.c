@@ -1,10 +1,14 @@
 #include "ble_interface.h"
+#include "../interface/gateway_interface.h"
 
 #include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/addr.h>
+#include <zephyr/bluetooth/uuid.h>
 #include <zephyr/kernel.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -13,6 +17,29 @@
 static ble_interface_callbacks_t g_callbacks;
 static bool g_ble_ready;
 static bool g_scanning;
+
+typedef struct {
+    struct bt_gatt_discover_params params;
+    struct bt_uuid_any uuid;
+    struct k_sem done;
+    uint16_t value_handle;
+    int err;
+} gatt_discover_ctx_t;
+
+typedef struct {
+    struct bt_gatt_write_params params;
+    struct k_sem done;
+    int err;
+} gatt_write_ctx_t;
+
+typedef struct {
+    struct bt_gatt_read_params params;
+    struct k_sem done;
+    uint8_t *data_out;
+    size_t *data_len_in_out;
+    size_t bytes_copied;
+    int err;
+} gatt_read_ctx_t;
 
 typedef struct {
     char name[32];
@@ -28,11 +55,54 @@ typedef struct {
     bool used;
     char address[GATEWAY_MAX_ADDRESS_LEN];
     struct bt_conn *conn;
+    struct bt_gatt_exchange_params mtu_params;
+    bool mtu_exchange_in_progress;
 } active_conn_t;
 
 static active_conn_t g_active_conns[GATEWAY_MAX_SENSORS];
 
 static known_peer_t g_known_peers[BLE_MAX_DISCOVERED_PEERS];
+static gatt_discover_ctx_t g_discover_ctx;
+static gatt_write_ctx_t g_write_ctx;
+static gatt_read_ctx_t g_read_ctx;
+
+static void emit_gatt_debug(
+    const char *phase,
+    const char *address,
+    const char *characteristic_uuid,
+    uint16_t handle,
+    uint16_t mtu,
+    size_t data_len,
+    int rc,
+    bool without_response
+)
+{
+    char line[512];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"gatt_debug\","
+        "\"phase\":\"%s\","
+        "\"address\":\"%s\","
+        "\"characteristic_uuid\":\"%s\","
+        "\"handle\":%u,"
+        "\"mtu\":%u,"
+        "\"data_len\":%u,"
+        "\"without_response\":%s,"
+        "\"rc\":%d}",
+        phase != NULL ? phase : "",
+        address != NULL ? address : "",
+        characteristic_uuid != NULL ? characteristic_uuid : "",
+        handle,
+        mtu,
+        (unsigned int)data_len,
+        without_response ? "true" : "false",
+        rc
+    );
+
+    gateway_interface_send_log(line);
+}
 
 static bool parse_advertising_data(
     struct bt_data *data,
@@ -102,6 +172,59 @@ static active_conn_t *find_active_conn_by_conn(const struct bt_conn *conn)
     }
 
     return NULL;
+}
+
+static void finalize_connected(struct bt_conn *conn)
+{
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+
+    format_address(bt_conn_get_dst(conn), address, sizeof(address));
+
+    emit_gatt_debug(
+        "connected_ready",
+        address,
+        "",
+        0,
+        bt_gatt_get_mtu(conn),
+        0,
+        0,
+        false
+    );
+
+    if (g_callbacks.on_connected != NULL) {
+        g_callbacks.on_connected(address, (uint16_t)bt_conn_index(conn));
+    }
+}
+
+static void mtu_exchange_cb(
+    struct bt_conn *conn,
+    uint8_t err,
+    struct bt_gatt_exchange_params *params
+)
+{
+    active_conn_t *entry = find_active_conn_by_conn(conn);
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+
+    ARG_UNUSED(params);
+
+    if (entry != NULL) {
+        entry->mtu_exchange_in_progress = false;
+    }
+
+    format_address(bt_conn_get_dst(conn), address, sizeof(address));
+
+    emit_gatt_debug(
+        "mtu_exchange_complete",
+        address,
+        "",
+        0,
+        bt_gatt_get_mtu(conn),
+        0,
+        err == 0 ? 0 : -(int)err,
+        false
+    );
+
+    finalize_connected(conn);
 }
 
 static active_conn_t *allocate_active_conn(const char *address)
@@ -183,9 +306,199 @@ static known_peer_t *upsert_known_peer(const bt_addr_le_t *addr)
     return free_slot;
 }
 
+static uint8_t discover_characteristic_cb(
+    struct bt_conn *conn,
+    const struct bt_gatt_attr *attr,
+    struct bt_gatt_discover_params *params
+)
+{
+    gatt_discover_ctx_t *ctx =
+        CONTAINER_OF(params, gatt_discover_ctx_t, params);
+
+    ARG_UNUSED(conn);
+
+    if (attr == NULL) {
+        k_sem_give(&ctx->done);
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (params->type == BT_GATT_DISCOVER_CHARACTERISTIC) {
+        const struct bt_gatt_chrc *chrc =
+            (const struct bt_gatt_chrc *)attr->user_data;
+
+        if (chrc != NULL) {
+            ctx->value_handle = chrc->value_handle;
+            k_sem_give(&ctx->done);
+            return BT_GATT_ITER_STOP;
+        }
+    }
+
+    return BT_GATT_ITER_CONTINUE;
+}
+
+static void write_complete_cb(
+    struct bt_conn *conn,
+    uint8_t err,
+    struct bt_gatt_write_params *params
+)
+{
+    ARG_UNUSED(conn);
+    ARG_UNUSED(params);
+
+    g_write_ctx.err = err == 0 ? 0 : -(int)err;
+    k_sem_give(&g_write_ctx.done);
+}
+
+static uint8_t read_complete_cb(
+    struct bt_conn *conn,
+    uint8_t err,
+    struct bt_gatt_read_params *params,
+    const void *data,
+    uint16_t length
+)
+{
+    ARG_UNUSED(conn);
+    ARG_UNUSED(params);
+
+    if (err != 0U) {
+        g_read_ctx.err = -(int)err;
+        k_sem_give(&g_read_ctx.done);
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (data == NULL) {
+        if (g_read_ctx.data_len_in_out != NULL) {
+            *g_read_ctx.data_len_in_out = g_read_ctx.bytes_copied;
+        }
+        g_read_ctx.err = 0;
+        k_sem_give(&g_read_ctx.done);
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (g_read_ctx.data_out == NULL || g_read_ctx.data_len_in_out == NULL) {
+        g_read_ctx.err = -1;
+        k_sem_give(&g_read_ctx.done);
+        return BT_GATT_ITER_STOP;
+    }
+
+    size_t capacity = *g_read_ctx.data_len_in_out;
+    size_t remaining = capacity > g_read_ctx.bytes_copied
+        ? capacity - g_read_ctx.bytes_copied
+        : 0;
+    size_t to_copy = length;
+
+    if (to_copy > remaining) {
+        to_copy = remaining;
+    }
+
+    memcpy(g_read_ctx.data_out + g_read_ctx.bytes_copied, data, to_copy);
+    g_read_ctx.bytes_copied += to_copy;
+
+    return BT_GATT_ITER_CONTINUE;
+}
+
+static int discover_characteristic_handle(
+    struct bt_conn *conn,
+    const char *characteristic_uuid,
+    uint16_t *handle_out
+)
+{
+    int rc;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+
+    if (conn == NULL || characteristic_uuid == NULL || handle_out == NULL) {
+        return -1;
+    }
+
+    format_address(bt_conn_get_dst(conn), address, sizeof(address));
+
+    memset(&g_discover_ctx, 0, sizeof(g_discover_ctx));
+    k_sem_init(&g_discover_ctx.done, 0, 1);
+
+    rc = bt_uuid_from_str(characteristic_uuid, &g_discover_ctx.uuid);
+    if (rc < 0) {
+        return rc;
+    }
+
+    g_discover_ctx.params.uuid = &g_discover_ctx.uuid.uuid;
+    g_discover_ctx.params.func = discover_characteristic_cb;
+    g_discover_ctx.params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+    g_discover_ctx.params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+    g_discover_ctx.params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+    emit_gatt_debug(
+        "discover_start",
+        address,
+        characteristic_uuid,
+        0,
+        bt_gatt_get_mtu(conn),
+        0,
+        0,
+        false
+    );
+
+    rc = bt_gatt_discover(conn, &g_discover_ctx.params);
+    if (rc != 0) {
+        emit_gatt_debug(
+            "discover_submit_failed",
+            address,
+            characteristic_uuid,
+            0,
+            bt_gatt_get_mtu(conn),
+            0,
+            rc,
+            false
+        );
+        return rc;
+    }
+
+    if (k_sem_take(&g_discover_ctx.done, K_SECONDS(5)) != 0) {
+        emit_gatt_debug(
+            "discover_timeout",
+            address,
+            characteristic_uuid,
+            0,
+            bt_gatt_get_mtu(conn),
+            0,
+            -110,
+            false
+        );
+        return -110;
+    }
+
+    if (g_discover_ctx.value_handle == 0) {
+        emit_gatt_debug(
+            "discover_characteristic",
+            address,
+            characteristic_uuid,
+            0,
+            bt_gatt_get_mtu(conn),
+            0,
+            -2,
+            false
+        );
+        return -2;
+    }
+
+    *handle_out = g_discover_ctx.value_handle;
+    emit_gatt_debug(
+        "discover_characteristic",
+        address,
+        characteristic_uuid,
+        *handle_out,
+        bt_gatt_get_mtu(conn),
+        0,
+        0,
+        false
+    );
+    return 0;
+}
+
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
     char address[GATEWAY_MAX_ADDRESS_LEN];
+    active_conn_t *entry = find_active_conn_by_conn(conn);
+    int mtu_rc;
 
     format_address(bt_conn_get_dst(conn), address, sizeof(address));
 
@@ -196,8 +509,24 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
-    if (g_callbacks.on_connected != NULL) {
-        g_callbacks.on_connected(address, (uint16_t)bt_conn_index(conn));
+    if (entry == NULL) {
+        finalize_connected(conn);
+        return;
+    }
+
+    entry->mtu_params.func = mtu_exchange_cb;
+    entry->mtu_exchange_in_progress = true;
+    mtu_rc = bt_gatt_exchange_mtu(conn, &entry->mtu_params);
+
+    if (mtu_rc == -EALREADY) {
+        entry->mtu_exchange_in_progress = false;
+        finalize_connected(conn);
+        return;
+    }
+
+    if (mtu_rc != 0) {
+        entry->mtu_exchange_in_progress = false;
+        finalize_connected(conn);
     }
 }
 
@@ -434,18 +763,96 @@ int ble_interface_read(
     size_t *data_len_in_out
 )
 {
-    (void)address;
-    (void)characteristic_uuid;
-    (void)data_out;
-    (void)data_len_in_out;
+    active_conn_t *entry;
+    uint16_t handle;
+    int rc;
 
-    /*
-     * TODO:
-     * - read characteristic
-     * - copy bytes to caller buffer
-     * - update returned length
-     */
-    return -2;
+    if (address == NULL || characteristic_uuid == NULL ||
+        data_out == NULL || data_len_in_out == NULL ||
+        *data_len_in_out == 0) {
+        return -1;
+    }
+
+    entry = find_active_conn_by_address(address);
+    if (entry == NULL || entry->conn == NULL) {
+        return -3;
+    }
+
+    rc = discover_characteristic_handle(entry->conn, characteristic_uuid, &handle);
+    if (rc != 0) {
+        emit_gatt_debug(
+            "read_discover_failed",
+            address,
+            characteristic_uuid,
+            0,
+            bt_gatt_get_mtu(entry->conn),
+            0,
+            rc,
+            false
+        );
+        return rc;
+    }
+
+    emit_gatt_debug(
+        "read_start",
+        address,
+        characteristic_uuid,
+        handle,
+        bt_gatt_get_mtu(entry->conn),
+        *data_len_in_out,
+        0,
+        false
+    );
+
+    memset(&g_read_ctx, 0, sizeof(g_read_ctx));
+    k_sem_init(&g_read_ctx.done, 0, 1);
+    g_read_ctx.data_out = data_out;
+    g_read_ctx.data_len_in_out = data_len_in_out;
+    g_read_ctx.params.func = read_complete_cb;
+    g_read_ctx.params.handle_count = 1;
+    g_read_ctx.params.single.handle = handle;
+    g_read_ctx.params.single.offset = 0U;
+
+    rc = bt_gatt_read(entry->conn, &g_read_ctx.params);
+    if (rc != 0) {
+        emit_gatt_debug(
+            "read_submit_failed",
+            address,
+            characteristic_uuid,
+            handle,
+            bt_gatt_get_mtu(entry->conn),
+            *data_len_in_out,
+            rc,
+            false
+        );
+        return rc;
+    }
+
+    if (k_sem_take(&g_read_ctx.done, K_SECONDS(5)) != 0) {
+        emit_gatt_debug(
+            "read_timeout",
+            address,
+            characteristic_uuid,
+            handle,
+            bt_gatt_get_mtu(entry->conn),
+            *data_len_in_out,
+            -110,
+            false
+        );
+        return -110;
+    }
+
+    emit_gatt_debug(
+        "read_complete",
+        address,
+        characteristic_uuid,
+        handle,
+        bt_gatt_get_mtu(entry->conn),
+        *data_len_in_out,
+        g_read_ctx.err,
+        false
+    );
+    return g_read_ctx.err;
 }
 
 int ble_interface_write(
@@ -456,17 +863,115 @@ int ble_interface_write(
     bool without_response
 )
 {
-    (void)address;
-    (void)characteristic_uuid;
-    (void)data;
-    (void)data_len;
-    (void)without_response;
+    active_conn_t *entry;
+    uint16_t handle;
+    int rc;
 
-    /*
-     * TODO:
-     * - write characteristic
-     */
-    return -2;
+    if (address == NULL || characteristic_uuid == NULL || data == NULL ||
+        data_len == 0) {
+        return -1;
+    }
+
+    entry = find_active_conn_by_address(address);
+    if (entry == NULL || entry->conn == NULL) {
+        return -3;
+    }
+
+    rc = discover_characteristic_handle(entry->conn, characteristic_uuid, &handle);
+    if (rc != 0) {
+        emit_gatt_debug(
+            "write_discover_failed",
+            address,
+            characteristic_uuid,
+            0,
+            bt_gatt_get_mtu(entry->conn),
+            data_len,
+            rc,
+            without_response
+        );
+        return rc;
+    }
+
+    emit_gatt_debug(
+        "write_start",
+        address,
+        characteristic_uuid,
+        handle,
+        bt_gatt_get_mtu(entry->conn),
+        data_len,
+        0,
+        without_response
+    );
+
+    if (without_response) {
+        rc = bt_gatt_write_without_response(
+            entry->conn,
+            handle,
+            data,
+            (uint16_t)data_len,
+            false
+        );
+        emit_gatt_debug(
+            "write_complete",
+            address,
+            characteristic_uuid,
+            handle,
+            bt_gatt_get_mtu(entry->conn),
+            data_len,
+            rc,
+            true
+        );
+        return rc;
+    }
+
+    memset(&g_write_ctx, 0, sizeof(g_write_ctx));
+    k_sem_init(&g_write_ctx.done, 0, 1);
+    g_write_ctx.params.handle = handle;
+    g_write_ctx.params.offset = 0;
+    g_write_ctx.params.data = data;
+    g_write_ctx.params.length = (uint16_t)data_len;
+    g_write_ctx.params.func = write_complete_cb;
+
+    rc = bt_gatt_write(entry->conn, &g_write_ctx.params);
+    if (rc != 0) {
+        emit_gatt_debug(
+            "write_submit_failed",
+            address,
+            characteristic_uuid,
+            handle,
+            bt_gatt_get_mtu(entry->conn),
+            data_len,
+            rc,
+            false
+        );
+        return rc;
+    }
+
+    if (k_sem_take(&g_write_ctx.done, K_SECONDS(5)) != 0) {
+        emit_gatt_debug(
+            "write_timeout",
+            address,
+            characteristic_uuid,
+            handle,
+            bt_gatt_get_mtu(entry->conn),
+            data_len,
+            -110,
+            false
+        );
+        return -110;
+    }
+
+    emit_gatt_debug(
+        "write_complete",
+        address,
+        characteristic_uuid,
+        handle,
+        bt_gatt_get_mtu(entry->conn),
+        data_len,
+        g_write_ctx.err,
+        false
+    );
+    return g_write_ctx.err;
 }
 
 int ble_interface_get_rssi(const char *address, int8_t *rssi_out)

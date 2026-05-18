@@ -4,6 +4,7 @@
 #include "../ble/ble_scheduler.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
 static const char *request_id_or_null(const gateway_command_t *command)
 {
@@ -97,12 +98,43 @@ static void on_gateway_command(const gateway_command_t *command)
         break;
 
     case GW_CMD_GATT_WRITE:
-        send_not_implemented(command, "gatt_write");
+    {
+        int rc = ble_scheduler_gatt_write(
+                request_id_or_null(command),
+                command->address,
+                command->characteristic_uuid,
+                command->payload,
+                command->payload_len,
+                command->without_response
+            );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "gatt_write_failed",
+                rc
+            );
+        }
         break;
+    }
 
     case GW_CMD_GATT_READ:
-        send_not_implemented(command, "gatt_read");
+    {
+        int rc = ble_scheduler_gatt_read(
+            request_id_or_null(command),
+            command->address,
+            command->characteristic_uuid
+        );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "gatt_read_failed",
+                rc
+            );
+        }
         break;
+    }
 
     case GW_CMD_DISCONNECT_ALL:
         if (ble_scheduler_disconnect_all() != 0) {

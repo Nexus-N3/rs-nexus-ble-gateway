@@ -20,6 +20,8 @@ MOVELLA_UUID_HINTS = {
     "15172003-4947-11e9-8646-d663bd873d93",
     "15172004-4947-11e9-8646-d663bd873d93",
 }
+MOVELLA_DEVICE_CONTROL_UUID = "15171002-4947-11e9-8646-d663bd873d93"
+MOVELLA_IDENTIFY_HEX = "010102"
 
 
 def disconnect_addresses(ser, addresses, timeout_s=10):
@@ -73,6 +75,136 @@ def disconnect_addresses(ser, addresses, timeout_s=10):
         print(json.dumps(msg, indent=2))
 
     raise TimeoutError(f"Timed out waiting for disconnect of: {', '.join(pending)}")
+
+
+def gatt_write_address(
+    ser,
+    address,
+    characteristic_uuid,
+    payload_hex,
+    without_response=False,
+    timeout_s=10,
+):
+    request_id = f"write_{int(time.time() * 1000)}"
+
+    send_jsonl(
+        ser,
+        {
+            "type": "gatt_write",
+            "request_id": request_id,
+            "address": address,
+            "characteristic_uuid": characteristic_uuid,
+            "payload_hex": payload_hex,
+            "without_response": without_response,
+        },
+    )
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        msg = read_json_any(ser, timeout_s=max(0.1, deadline - time.time()))
+        msg_type = msg.get("type")
+
+        if msg_type == "write_complete" and msg.get("request_id") == request_id:
+            print(
+                f"WRITE COMPLETE: {address} uuid={characteristic_uuid}"
+            )
+            return True
+
+        if msg_type == "error" and msg.get("request_id") == request_id:
+            raise RuntimeError(
+                f"Gateway gatt_write failed: {msg.get('message')} "
+                f"({msg.get('error_code')})"
+            )
+
+    raise TimeoutError(f"Timed out waiting for gatt_write on {address}")
+
+
+def gatt_read_address(
+    ser,
+    address,
+    characteristic_uuid,
+    timeout_s=10,
+):
+    request_id = f"read_{int(time.time() * 1000)}"
+
+    send_jsonl(
+        ser,
+        {
+            "type": "gatt_read",
+            "request_id": request_id,
+            "address": address,
+            "characteristic_uuid": characteristic_uuid,
+        },
+    )
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        msg = read_json_any(ser, timeout_s=max(0.1, deadline - time.time()))
+        msg_type = msg.get("type")
+
+        if msg_type == "read_result" and msg.get("request_id") == request_id:
+            payload_hex = msg.get("payload_hex", "")
+            print(
+                f"READ COMPLETE: {address} uuid={characteristic_uuid} "
+                f"payload_hex={payload_hex}"
+            )
+            return payload_hex
+
+        if msg_type == "error" and msg.get("request_id") == request_id:
+            raise RuntimeError(
+                f"Gateway gatt_read failed: {msg.get('message')} "
+                f"({msg.get('error_code')})"
+            )
+
+    raise TimeoutError(f"Timed out waiting for gatt_read on {address}")
+
+
+def identify_address(ser, address, args):
+    last_error = None
+
+    for attempt in range(args.identify_retry_attempts + 1):
+        if args.pre_identify_delay_s > 0:
+            print(
+                f"Waiting {args.pre_identify_delay_s:.1f}s before identify on "
+                f"{address} (attempt {attempt + 1})..."
+            )
+            time.sleep(args.pre_identify_delay_s)
+
+        try:
+            current_hex = gatt_read_address(
+                ser,
+                address,
+                MOVELLA_DEVICE_CONTROL_UUID,
+                timeout_s=args.read_timeout_s,
+            )
+            if len(current_hex) < 6:
+                raise RuntimeError(
+                    f"Device control read too short for identify on {address}: "
+                    f"{current_hex}"
+                )
+
+            identify_hex = MOVELLA_IDENTIFY_HEX + current_hex[6:]
+            gatt_write_address(
+                ser,
+                address,
+                MOVELLA_DEVICE_CONTROL_UUID,
+                identify_hex,
+                without_response=args.without_response,
+                timeout_s=args.write_timeout_s,
+            )
+            return
+        except (RuntimeError, TimeoutError) as exc:
+            last_error = exc
+            if attempt < args.identify_retry_attempts:
+                print(
+                    f"Identify attempt {attempt + 1} failed for {address}: {exc}"
+                )
+                print(
+                    f"Retrying identify in {args.identify_retry_delay_s:.1f}s..."
+                )
+                time.sleep(args.identify_retry_delay_s)
+
+    raise RuntimeError(f"Identify failed for {address}: {last_error}")
 
 
 def match_sensor_name(
@@ -509,6 +641,95 @@ def run_auto_connect_disconnect(args):
             )
         )
 
+
+def run_identify(args):
+    with open_gateway_serial(args.port) as ser:
+        command_hello(ser)
+
+        addresses = list(args.address)
+
+        if not args.skip_discover:
+            matches = discover_movella(ser, timeout_ms=args.timeout_ms)
+            matched_addresses = {entry["address"] for entry in matches}
+            missing = [address for address in addresses if address not in matched_addresses]
+            if missing:
+                raise RuntimeError(
+                    "Requested addresses were not found in current Movella scan: "
+                    + ", ".join(missing)
+                )
+
+        connected = connect_addresses(
+            ser,
+            addresses,
+            attempt_timeout_s=args.connect_attempt_timeout_s,
+            retry_attempts=args.connect_retry_attempts,
+            retry_delay_s=args.connect_retry_delay_s,
+        )
+
+        for address in connected:
+            identify_address(ser, address, args)
+
+        if args.hold_s > 0:
+            print(f"Waiting {args.hold_s:.1f} seconds before disconnect...")
+            time.sleep(args.hold_s)
+
+        disconnected = disconnect_addresses(
+            ser,
+            connected,
+            timeout_s=args.disconnect_timeout_s,
+        )
+
+        print(
+            json.dumps(
+                {
+                    "identified": connected,
+                    "disconnected": disconnected,
+                },
+                indent=2,
+            )
+        )
+
+
+def run_auto_identify(args):
+    with open_gateway_serial(args.port) as ser:
+        command_hello(ser)
+        matches = discover_movella(ser, timeout_ms=args.timeout_ms)
+        selected = select_discovered_addresses(matches, args.count)
+
+        print(f"AUTO-IDENTIFY addresses: {selected}")
+        connected = connect_addresses(
+            ser,
+            selected,
+            attempt_timeout_s=args.connect_attempt_timeout_s,
+            retry_attempts=args.connect_retry_attempts,
+            retry_delay_s=args.connect_retry_delay_s,
+        )
+
+        for address in connected:
+            identify_address(ser, address, args)
+
+        if args.hold_s > 0:
+            print(f"Waiting {args.hold_s:.1f} seconds before disconnect...")
+            time.sleep(args.hold_s)
+
+        disconnected = disconnect_addresses(
+            ser,
+            connected,
+            timeout_s=args.disconnect_timeout_s,
+        )
+
+        print(
+            json.dumps(
+                {
+                    "matched": matches,
+                    "selected": selected,
+                    "identified": connected,
+                    "disconnected": disconnected,
+                },
+                indent=2,
+            )
+        )
+
 def main():
     parser = argparse.ArgumentParser(
         description="Discover and connect Movella DOT sensors through rs-nexus-ble-gateway."
@@ -597,6 +818,58 @@ def main():
         help="Seconds to wait after connecting before disconnecting.",
     )
     auto_connect_disconnect_parser.set_defaults(func=run_auto_connect_disconnect)
+
+    identify_parser = subparsers.add_parser(
+        "identify",
+        help="Connect explicit sensor addresses, send identify, then disconnect.",
+    )
+    identify_parser.add_argument(
+        "--address",
+        action="append",
+        required=True,
+        help="BLE address to identify. Repeat for multiple sensors.",
+    )
+    identify_parser.add_argument("--timeout-ms", type=int, default=5000)
+    identify_parser.add_argument(
+        "--skip-discover",
+        action="store_true",
+        help="Skip the pre-connect discovery pass.",
+    )
+    add_connect_retry_args(identify_parser)
+    identify_parser.add_argument("--read-timeout-s", type=float, default=15.0)
+    identify_parser.add_argument("--write-timeout-s", type=float, default=15.0)
+    identify_parser.add_argument("--disconnect-timeout-s", type=float, default=30.0)
+    identify_parser.add_argument("--hold-s", type=float, default=10.0)
+    identify_parser.add_argument("--pre-identify-delay-s", type=float, default=2.0)
+    identify_parser.add_argument("--identify-retry-attempts", type=int, default=1)
+    identify_parser.add_argument("--identify-retry-delay-s", type=float, default=1.0)
+    identify_parser.add_argument(
+        "--without-response",
+        action="store_true",
+        help="Use write without response for the identify command.",
+    )
+    identify_parser.set_defaults(func=run_identify)
+
+    auto_identify_parser = subparsers.add_parser(
+        "auto-identify",
+        help="Scan for Movella DOT sensors, connect the first N matches, send identify, then disconnect.",
+    )
+    auto_identify_parser.add_argument("--count", type=int, required=True)
+    auto_identify_parser.add_argument("--timeout-ms", type=int, default=5000)
+    add_connect_retry_args(auto_identify_parser)
+    auto_identify_parser.add_argument("--read-timeout-s", type=float, default=15.0)
+    auto_identify_parser.add_argument("--write-timeout-s", type=float, default=15.0)
+    auto_identify_parser.add_argument("--disconnect-timeout-s", type=float, default=30.0)
+    auto_identify_parser.add_argument("--hold-s", type=float, default=10.0)
+    auto_identify_parser.add_argument("--pre-identify-delay-s", type=float, default=2.0)
+    auto_identify_parser.add_argument("--identify-retry-attempts", type=int, default=1)
+    auto_identify_parser.add_argument("--identify-retry-delay-s", type=float, default=1.0)
+    auto_identify_parser.add_argument(
+        "--without-response",
+        action="store_true",
+        help="Use write without response for the identify command.",
+    )
+    auto_identify_parser.set_defaults(func=run_auto_identify)
 
     args = parser.parse_args()
     try:

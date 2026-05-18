@@ -44,6 +44,25 @@ static uint8_t g_disconnect_pending_count;
 static gateway_sensor_t g_sensors[GATEWAY_MAX_SENSORS];
 static uint8_t g_sensor_count = 0;
 
+typedef enum {
+    GATT_OP_NONE = 0,
+    GATT_OP_READ,
+    GATT_OP_WRITE,
+} gatt_op_type_t;
+
+typedef struct {
+    bool pending;
+    gatt_op_type_t type;
+    char request_id[GATEWAY_MAX_REQUEST_ID_LEN];
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
+    bool without_response;
+    uint16_t payload_len;
+    uint8_t payload[GATEWAY_MAX_FRAME_PAYLOAD];
+} pending_gatt_op_t;
+
+static pending_gatt_op_t g_pending_gatt_op;
+
 static ble_scheduler_policy_t g_policy = {
     .max_parallel_connects = 1,
     .connect_gap_ms = 500,
@@ -145,6 +164,7 @@ static int start_next_connect(void)
 int ble_scheduler_init(void)
 {
     memset(g_sensors, 0, sizeof(g_sensors));
+    memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
     g_sensor_count = 0;
     g_connect_queue_count = 0;
     g_connect_queue_index = 0;
@@ -295,6 +315,7 @@ int ble_scheduler_unsubscribe(
 }
 
 int ble_scheduler_gatt_write(
+    const char *request_id,
     const char *address,
     const char *characteristic_uuid,
     const uint8_t *data,
@@ -306,33 +327,67 @@ int ble_scheduler_gatt_write(
         return -1;
     }
 
-    return ble_interface_write(
-        address,
+    if (g_pending_gatt_op.pending) {
+        return -16;
+    }
+
+    memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+    g_pending_gatt_op.pending = true;
+    g_pending_gatt_op.type = GATT_OP_WRITE;
+    g_pending_gatt_op.without_response = without_response;
+    g_pending_gatt_op.payload_len = data_len;
+    strncpy(g_pending_gatt_op.address, address, sizeof(g_pending_gatt_op.address) - 1);
+    strncpy(
+        g_pending_gatt_op.characteristic_uuid,
         characteristic_uuid,
-        data,
-        data_len,
-        without_response
+        sizeof(g_pending_gatt_op.characteristic_uuid) - 1
     );
+    if (request_id != NULL) {
+        strncpy(
+            g_pending_gatt_op.request_id,
+            request_id,
+            sizeof(g_pending_gatt_op.request_id) - 1
+        );
+    }
+    if (data_len > sizeof(g_pending_gatt_op.payload)) {
+        data_len = sizeof(g_pending_gatt_op.payload);
+        g_pending_gatt_op.payload_len = data_len;
+    }
+    memcpy(g_pending_gatt_op.payload, data, data_len);
+    return 0;
 }
 
 int ble_scheduler_gatt_read(
+    const char *request_id,
     const char *address,
     const char *characteristic_uuid
 )
 {
-    uint8_t buffer[GATEWAY_MAX_FRAME_PAYLOAD];
-    size_t data_len = sizeof(buffer);
-
     if (address == NULL || characteristic_uuid == NULL) {
         return -1;
     }
 
-    return ble_interface_read(
-        address,
+    if (g_pending_gatt_op.pending) {
+        return -16;
+    }
+
+    memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+    g_pending_gatt_op.pending = true;
+    g_pending_gatt_op.type = GATT_OP_READ;
+    strncpy(g_pending_gatt_op.address, address, sizeof(g_pending_gatt_op.address) - 1);
+    strncpy(
+        g_pending_gatt_op.characteristic_uuid,
         characteristic_uuid,
-        buffer,
-        &data_len
+        sizeof(g_pending_gatt_op.characteristic_uuid) - 1
     );
+    if (request_id != NULL) {
+        strncpy(
+            g_pending_gatt_op.request_id,
+            request_id,
+            sizeof(g_pending_gatt_op.request_id) - 1
+        );
+    }
+    return 0;
 }
 
 int ble_scheduler_disconnect_all(void)
@@ -363,6 +418,82 @@ void ble_scheduler_tick(void)
     if (g_scan_active && k_uptime_get() >= g_scan_deadline_ms) {
         ble_scheduler_stop_scan();
     }
+
+    if (!g_pending_gatt_op.pending) {
+        return;
+    }
+
+    if (g_pending_gatt_op.type == GATT_OP_READ) {
+        uint8_t buffer[GATEWAY_MAX_FRAME_PAYLOAD];
+        size_t data_len = sizeof(buffer);
+        int rc = ble_interface_read(
+            g_pending_gatt_op.address,
+            g_pending_gatt_op.characteristic_uuid,
+            buffer,
+            &data_len
+        );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                g_pending_gatt_op.request_id[0] != '\0' ? g_pending_gatt_op.request_id : NULL,
+                "gatt_read_failed",
+                rc
+            );
+        } else {
+            static const char hex_chars[] = "0123456789ABCDEF";
+            char payload_hex[(GATEWAY_MAX_FRAME_PAYLOAD * 2) + 1];
+            char line[768];
+
+            for (size_t i = 0; i < data_len; i++) {
+                payload_hex[i * 2] = hex_chars[(buffer[i] >> 4) & 0x0F];
+                payload_hex[i * 2 + 1] = hex_chars[buffer[i] & 0x0F];
+            }
+            payload_hex[data_len * 2] = '\0';
+
+            snprintf(
+                line,
+                sizeof(line),
+                "{\"type\":\"read_result\",\"request_id\":\"%s\","
+                "\"address\":\"%s\",\"characteristic_uuid\":\"%s\","
+                "\"payload_hex\":\"%s\",\"ok\":true}",
+                g_pending_gatt_op.request_id,
+                g_pending_gatt_op.address,
+                g_pending_gatt_op.characteristic_uuid,
+                payload_hex
+            );
+            gateway_interface_send_json_line(line);
+        }
+    } else if (g_pending_gatt_op.type == GATT_OP_WRITE) {
+        int rc = ble_interface_write(
+            g_pending_gatt_op.address,
+            g_pending_gatt_op.characteristic_uuid,
+            g_pending_gatt_op.payload,
+            g_pending_gatt_op.payload_len,
+            g_pending_gatt_op.without_response
+        );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                g_pending_gatt_op.request_id[0] != '\0' ? g_pending_gatt_op.request_id : NULL,
+                "gatt_write_failed",
+                rc
+            );
+        } else {
+            char line[256];
+            snprintf(
+                line,
+                sizeof(line),
+                "{\"type\":\"write_complete\",\"request_id\":\"%s\","
+                "\"address\":\"%s\",\"characteristic_uuid\":\"%s\",\"ok\":true}",
+                g_pending_gatt_op.request_id,
+                g_pending_gatt_op.address,
+                g_pending_gatt_op.characteristic_uuid
+            );
+            gateway_interface_send_json_line(line);
+        }
+    }
+
+    memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
 }
 
 void ble_scheduler_on_sensor_found(const ble_discovered_sensor_t *found)
