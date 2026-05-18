@@ -24,7 +24,7 @@ buffering
 */
 #include "ble_scheduler.h"
 #include "ble_interface.h"
-#include "../sensors/sensor_spec.h"
+//#include "../sensors/sensor_spec.h"
 #include "../interface/gateway_interface.h"
 #include "../config/gateway_config.h"
 #include <string.h>
@@ -112,7 +112,7 @@ int ble_scheduler_start_scan(const char *request_id, uint32_t timeout_ms)
     g_scan_deadline_ms = k_uptime_get() + timeout_ms;
     g_scan_active = true;
 
-    return ble_interface_start_scan(NULL, timeout_ms);
+    return ble_interface_start_scan(timeout_ms);
 }
 
 int ble_scheduler_stop_scan(void)
@@ -140,7 +140,7 @@ int ble_scheduler_connect_addresses(
     g_state = SCHEDULER_STATE_CONNECTING;
 
     for (uint8_t i = 0; i < sensor_count; i++) {
-        ble_interface_connect(sensors[i].address, NULL);
+        ble_interface_connect(sensors[i].address);
     }
 
     return 0;

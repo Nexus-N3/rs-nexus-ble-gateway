@@ -104,9 +104,9 @@ int ble_interface_init(const ble_interface_callbacks_t *callbacks)
     return 0;
 }
 
-int ble_interface_start_scan(const sensor_spec_t *spec, uint32_t timeout_ms)
+int ble_interface_start_scan(uint32_t timeout_ms)
 {
-    ARG_UNUSED(spec);
+    //(void)spec;
     ARG_UNUSED(timeout_ms);
 
     if (!g_ble_ready) {
@@ -148,10 +148,10 @@ int ble_interface_stop_scan(void)
     return 0;
 }
 
-int ble_interface_connect(const char *address, const sensor_spec_t *spec)
+int ble_interface_connect(const char *address)
 {
     (void)address;
-    (void)spec;
+    //(void)spec;
 
     /*
      * TODO:
@@ -172,10 +172,10 @@ int ble_interface_disconnect(const char *address)
     return -2;
 }
 
-int ble_interface_discover_gatt(const char *address, const sensor_spec_t *spec)
+int ble_interface_discover_gatt(const char *address)
 {
     (void)address;
-    (void)spec;
+    //(void)spec;
 
     /*
      * TODO:
