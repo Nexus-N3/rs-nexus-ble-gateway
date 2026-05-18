@@ -70,9 +70,22 @@ static void on_gateway_command(const gateway_command_t *command)
         break;
     }
 
-    case GW_CMD_DISCONNECT_ADDRESSES:
-        send_not_implemented(command, "disconnect_addresses");
+    case GW_CMD_DISCONNECT_ADDRESSES: {
+        int rc = ble_scheduler_disconnect_addresses(
+            command->addresses,
+            command->address_count
+        );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "disconnect_addresses_failed",
+                rc
+            );
+        }
+
         break;
+}
 
     case GW_CMD_SUBSCRIBE:
         send_not_implemented(command, "subscribe");

@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define BLE_MAX_DISCOVERED_PEERS 32
+
 static ble_interface_callbacks_t g_callbacks;
 static bool g_ble_ready;
 static bool g_scanning;
@@ -22,7 +24,13 @@ typedef struct {
     bt_addr_le_t addr;
 } known_peer_t;
 
-#define BLE_MAX_DISCOVERED_PEERS 32
+typedef struct {
+    bool used;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    struct bt_conn *conn;
+} active_conn_t;
+
+static active_conn_t g_active_conns[GATEWAY_MAX_SENSORS];
 
 static known_peer_t g_known_peers[BLE_MAX_DISCOVERED_PEERS];
 
@@ -71,6 +79,65 @@ static void format_address(
         addr->a.val[1],
         addr->a.val[0]
     );
+}
+
+static active_conn_t *find_active_conn_by_address(const char *address)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_conns); i++) {
+        if (g_active_conns[i].used &&
+            strcmp(g_active_conns[i].address, address) == 0) {
+            return &g_active_conns[i];
+        }
+    }
+
+    return NULL;
+}
+
+static active_conn_t *find_active_conn_by_conn(const struct bt_conn *conn)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_conns); i++) {
+        if (g_active_conns[i].used && g_active_conns[i].conn == conn) {
+            return &g_active_conns[i];
+        }
+    }
+
+    return NULL;
+}
+
+static active_conn_t *allocate_active_conn(const char *address)
+{
+    active_conn_t *existing = find_active_conn_by_address(address);
+    if (existing != NULL) {
+        return existing;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_conns); i++) {
+        if (!g_active_conns[i].used) {
+            memset(&g_active_conns[i], 0, sizeof(g_active_conns[i]));
+            g_active_conns[i].used = true;
+            strncpy(
+                g_active_conns[i].address,
+                address,
+                sizeof(g_active_conns[i].address) - 1
+            );
+            return &g_active_conns[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void release_active_conn(active_conn_t *entry)
+{
+    if (entry == NULL) {
+        return;
+    }
+
+    if (entry->conn != NULL) {
+        bt_conn_unref(entry->conn);
+    }
+
+    memset(entry, 0, sizeof(*entry));
 }
 
 static known_peer_t *find_known_peer(const char *address)
@@ -137,8 +204,13 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
     char address[GATEWAY_MAX_ADDRESS_LEN];
+    active_conn_t *entry = find_active_conn_by_conn(conn);
 
     format_address(bt_conn_get_dst(conn), address, sizeof(address));
+
+    if (entry != NULL) {
+        release_active_conn(entry);
+    }
 
     if (g_callbacks.on_disconnected != NULL) {
         g_callbacks.on_disconnected(address, (int)reason);
@@ -285,6 +357,15 @@ int ble_interface_connect(const char *address)
         }
     }
 
+    active_conn_t *entry = allocate_active_conn(address);
+    if (entry == NULL) {
+        return -4;
+    }
+
+    if (entry->conn != NULL) {
+        return 0;
+    }
+
     struct bt_conn *conn = NULL;
 
     int rc = bt_conn_le_create(
@@ -295,24 +376,29 @@ int ble_interface_connect(const char *address)
     );
 
     if (rc != 0) {
+        memset(entry, 0, sizeof(*entry));
         return rc;
     }
 
-    /*
-     * Keep the connection object alive until callbacks are fully wired.
-     * For the single-connect milestone this is acceptable.
-     */
+    entry->conn = conn;
+
     return 0;
 }
 
 int ble_interface_disconnect(const char *address)
 {
-    (void)address;
+    active_conn_t *entry;
 
-    /*
-     * TODO: disconnect.
-     */
-    return -2;
+    if (address == NULL || address[0] == '\0') {
+        return -1;
+    }
+
+    entry = find_active_conn_by_address(address);
+    if (entry == NULL || entry->conn == NULL) {
+        return -3;
+    }
+
+    return bt_conn_disconnect(entry->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 }
 
 int ble_interface_discover_gatt(const char *address)

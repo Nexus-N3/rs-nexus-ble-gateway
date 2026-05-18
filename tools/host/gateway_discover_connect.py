@@ -21,6 +21,38 @@ MOVELLA_UUID_HINTS = {
     "15172004-4947-11e9-8646-d663bd873d93",
 }
 
+def disconnect_addresses(ser, address, timeout_s=10):
+    request_id = f"disconnect_{int(time.time() * 1000)}"
+
+    send_jsonl(
+        ser,
+        {
+            "type": "disconnect_addresses",
+            "request_id": request_id,
+            "addresses": [address],
+        },
+    )
+
+    deadline = time.time() + timeout_s
+
+    while time.time() < deadline:
+        msg = read_json_any(ser, timeout_s=max(0.5, deadline - time.time()))
+        msg_type = msg.get("type")
+
+        if msg_type == "sensor_disconnected" and msg.get("address") == address:
+            print(f"DISCONNECTED: {address}")
+            return True
+
+        if msg_type == "error" and msg.get("request_id") == request_id:
+            raise RuntimeError(
+                f"Gateway error {msg.get('error_code')}: {msg.get('message')}"
+            )
+
+        print("Ignoring JSON message:")
+        print(json.dumps(msg, indent=2))
+
+    raise TimeoutError(f"Timed out waiting for disconnect of {address}")
+
 
 def match_sensor_name(
     local_name: str,
@@ -76,10 +108,13 @@ def read_json_any(ser, timeout_s=10):
 
     while time.time() < deadline:
         b = ser.read(1)
+
         if not b:
             continue
+
         if b == b"\r":
             continue
+
         if b != b"\n":
             line_buf.extend(b)
             continue
@@ -92,18 +127,23 @@ def read_json_any(ser, timeout_s=10):
 
         print("BOARD <-", line)
 
-        start = line.find("{")
-        end = line.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            continue
-
-        try:
-            return json.loads(line[start : end + 1])
-        except json.JSONDecodeError:
-            continue
+        for msg in json_objects_from_line(line):
+            return msg
 
     raise TimeoutError("Timed out waiting for JSON")
 
+def json_objects_from_line(line):
+    decoder = json.JSONDecoder()
+
+    for i, ch in enumerate(line):
+        if ch != "{":
+            continue
+
+        try:
+            obj, _ = decoder.raw_decode(line[i:])
+            yield obj
+        except json.JSONDecodeError:
+            continue
 
 def read_json_until(ser, wanted_type, request_id=None, timeout_s=10):
     deadline = time.time() + timeout_s
@@ -130,9 +170,9 @@ def open_gateway_serial(port):
     )
     ser.setDTR(True)
     ser.setRTS(True)
-    time.sleep(0.3)
+    time.sleep(0.5)
+    ser.reset_input_buffer()
     return ser
-
 
 def command_hello(ser):
     request_id = "hello_host_tool"
@@ -284,6 +324,53 @@ def run_auto_connect(args):
             )
         )
 
+def run_connect_disconnect(args):
+    with open_gateway_serial(args.port) as ser:
+        command_hello(ser)
+
+        addresses = list(args.address)
+
+        if not args.skip_discover:
+            matches = discover_movella(ser, timeout_ms=args.timeout_ms)
+            matched_addresses = {entry["address"] for entry in matches}
+            missing = [address for address in addresses if address not in matched_addresses]
+
+            if missing:
+                raise RuntimeError(
+                    "Requested addresses were not found in current Movella scan: "
+                    + ", ".join(missing)
+                )
+
+        connected = connect_addresses(
+            ser,
+            addresses,
+            timeout_s=args.timeout_s,
+        )
+
+        if not connected:
+            raise RuntimeError(f"Failed to connect to: {', '.join(addresses)}")
+
+        print(f"Waiting {args.hold_s:.1f} seconds before disconnect...")
+        time.sleep(args.hold_s)
+
+        disconnected = []
+
+        for address in connected:
+            if disconnect_addresses(
+                ser,
+                address,
+                timeout_s=args.timeout_s,
+            ):
+                disconnected.append(address)
+
+        print(
+            json.dumps(
+                {
+                    "connected_then_disconnected": disconnected,
+                },
+                indent=2,
+            )
+        )
 
 def main():
     parser = argparse.ArgumentParser(
@@ -318,6 +405,31 @@ def main():
     )
     connect_parser.add_argument("--timeout-s", type=float, default=30.0)
     connect_parser.set_defaults(func=run_connect)
+
+    connect_disconnect_parser = subparsers.add_parser(
+        "connect-disconnect",
+        help="Connect explicit sensor addresses, wait, then disconnect.",
+    )
+    connect_disconnect_parser.add_argument(
+        "--address",
+        action="append",
+        required=True,
+        help="BLE address to connect and disconnect. Repeat for multiple sensors.",
+    )
+    connect_disconnect_parser.add_argument("--timeout-ms", type=int, default=5000)
+    connect_disconnect_parser.add_argument(
+        "--skip-discover",
+        action="store_true",
+        help="Skip the pre-connect discovery pass.",
+    )
+    connect_disconnect_parser.add_argument("--timeout-s", type=float, default=30.0)
+    connect_disconnect_parser.add_argument(
+        "--hold-s",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after connecting before disconnecting.",
+    )
+    connect_disconnect_parser.set_defaults(func=run_connect_disconnect)
 
     auto_connect_parser = subparsers.add_parser(
         "auto-connect",

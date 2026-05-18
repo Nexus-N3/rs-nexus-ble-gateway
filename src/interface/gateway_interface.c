@@ -287,6 +287,15 @@ static void parse_command_line(const char *line, gateway_command_t *command)
 
     if (json_type_is(line, "disconnect_addresses")) {
         command->type = GW_CMD_DISCONNECT_ADDRESSES;
+
+        extract_address_array(
+            line,
+            "addresses",
+            command->addresses,
+            &command->address_count,
+            GATEWAY_MAX_SENSORS
+        );
+
         return;
     }
 
