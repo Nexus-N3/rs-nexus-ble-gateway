@@ -6,6 +6,8 @@
 #include <stddef.h>
 #include <stdio.h>
 
+
+// Helper function to get the request ID from a command, or return NULL if it's not set.
 static const char *request_id_or_null(const gateway_command_t *command)
 {
     if (command == NULL || command->request_id[0] == '\0') {
@@ -15,6 +17,7 @@ static const char *request_id_or_null(const gateway_command_t *command)
     return command->request_id;
 }
 
+// Helper function to send a "not implemented" error for a given command and command name.
 static void send_not_implemented(
     const gateway_command_t *command,
     const char *command_name
@@ -26,6 +29,7 @@ static void send_not_implemented(
     );
 }
 
+// Main handler for incoming gateway commands. This function is called by the gateway interface
 static void on_gateway_command(const gateway_command_t *command)
 {
 
