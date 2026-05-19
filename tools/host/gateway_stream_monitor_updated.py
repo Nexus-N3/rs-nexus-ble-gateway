@@ -353,6 +353,11 @@ class GatewayClient:
         )
         self.wait_for_request(request_id, "hello_ack", timeout_s=5.0)
 
+    def reset_session(self, timeout_s: float = 5.0):
+        request_id = f"reset_{int(time.time() * 1000)}"
+        self.send({"type": "reset_session", "request_id": request_id})
+        self.wait_for_request(request_id, "reset_session_complete", timeout_s)
+
     def discover_movella(self, timeout_ms: int) -> list[dict[str, Any]]:
         request_id = f"scan_{int(time.time() * 1000)}"
         self.send({"type": "scan_start", "request_id": request_id, "timeout_ms": timeout_ms})
@@ -446,6 +451,7 @@ class GatewayClient:
 
         try:
             self.wait_for_request(request_id, "write_complete", timeout_s)
+            return time.monotonic()
         except Exception as exc:
             raise RuntimeError(
                 f"gatt_write failed address={address} "
@@ -611,6 +617,7 @@ class StreamAttempt:
         self.unknown_sensor_ids = {}
 
     def run(self):
+        self.client.reset_session(timeout_s=5.0)
         self.client.hello()
         print(f"Scanning for up to {self.args.scan_timeout_ms}ms...")
         matches = self.client.discover_movella(self.args.scan_timeout_ms)
@@ -692,24 +699,25 @@ class StreamAttempt:
             time.sleep(0.25)
 
     def start_streams(self):
-        start_time = time.monotonic()
-        self.stream_started_at = start_time
-
-        for stats in self.stats.values():
-            stats.stream_start_command_time = start_time
-
         print(f"Starting stream. Total stream budget: {self.args.stream_seconds}s.")
+
+        batch_start_time = time.monotonic()
+        self.stream_started_at = batch_start_time
 
         for address in self.connected:
             print(f"START STREAM: {address}")
-            self.client.write(
+            self.stats[address].stream_start_command_time = time.monotonic()
+            write_complete_time = self.client.write(
                 address,
                 MOVELLA_START_STOP_STREAM_UUID,
                 MOVELLA_START_HEX,
                 timeout_s=self.args.write_timeout_s,
-                without_response=True,
+                without_response=self.args.without_response,
             )
-            time.sleep(0.1)
+            if write_complete_time is not None:
+                self.stats[address].stream_start_command_time = write_complete_time
+            self._drain_pending_stream_frames(timeout_s=0.02)
+            time.sleep(0.02)
 
         if self.args.use_startup_gate:
             print(
@@ -732,9 +740,9 @@ class StreamAttempt:
                     MOVELLA_START_STOP_STREAM_UUID,
                     MOVELLA_STOP_HEX,
                     timeout_s=self.args.write_timeout_s,
-                    without_response=True,
+                    without_response=self.args.without_response,
                 )
-                time.sleep(0.1)
+                time.sleep(0.02)
             except Exception as exc:
                 print(f"STOP STREAM FAILED: {address}: {exc}")
 
@@ -783,29 +791,75 @@ class StreamAttempt:
             except TimeoutError:
                 continue
 
-            if item_type == "stream_frame":
-                frame: StreamFrame = item
-                self.stream_frames_seen += 1
+            self._handle_item(item_type, item)
 
-                address = self.address_by_sensor_id.get(frame.sensor_id)
+        raise TimeoutError(f"Attempt timed out after {self.args.timeout_seconds}s")
 
-                if address not in self.stats:
-                    self.stream_frames_unknown_sensor_id += 1
-                    self.unknown_sensor_ids[frame.sensor_id] = (
-                        self.unknown_sensor_ids.get(frame.sensor_id, 0) + 1
+    def _drain_pending_stream_frames(self, timeout_s: float):
+        deadline = time.monotonic() + timeout_s
+
+        while time.monotonic() < deadline:
+            try:
+                item_type, item = self.client.read_item(timeout_s=0.005)
+            except TimeoutError:
+                return
+
+            self._handle_item(item_type, item)
+
+    def _handle_item(self, item_type: str, item):
+        if item_type == "stream_frame":
+            frame: StreamFrame = item
+            self.stream_frames_seen += 1
+
+            address = self.address_by_sensor_id.get(frame.sensor_id)
+
+            if address not in self.stats:
+                self.stream_frames_unknown_sensor_id += 1
+                self.unknown_sensor_ids[frame.sensor_id] = (
+                    self.unknown_sensor_ids.get(frame.sensor_id, 0) + 1
+                )
+
+                if self.stream_frames_unknown_sensor_id <= 10:
+                    print(
+                        "IGNORING STREAM FRAME: "
+                        f"unknown sensor_id={frame.sensor_id} "
+                        f"payload_len={len(frame.payload)} "
+                        f"known_ids={self.address_by_sensor_id}"
                     )
 
-                    if self.stream_frames_unknown_sensor_id <= 10:
-                        print(
-                            "IGNORING STREAM FRAME: "
-                            f"unknown sensor_id={frame.sensor_id} "
-                            f"payload_len={len(frame.payload)} "
-                            f"known_ids={self.address_by_sensor_id}"
-                        )
+                return
 
-                    continue
+            timestamp = parse_movella_timestamp(frame.payload)
+            self.stats[address].record_sample(
+                timestamp,
+                time.monotonic(),
+                self.measurement_active,
+                self.args.startup_gap_grace_seconds,
+            )
 
-                timestamp = parse_movella_timestamp(frame.payload)
+            if self.args.use_startup_gate and not self.measurement_active:
+                stable, _unstable = self.evaluate_startup_stability()
+                if stable:
+                    self.activate_measurement()
+
+            return
+
+        msg: dict[str, Any] = item
+        msg_type = msg.get("type")
+        if msg_type == "notification":
+            address = msg.get("address")
+            characteristic_uuid = str(msg.get("characteristic_uuid", "")).lower()
+
+            if characteristic_uuid == MOVELLA_LONG_PAYLOAD_UUID.lower() and address in self.stats:
+                payload_hex = msg.get("payload_hex", "")
+
+                try:
+                    payload = bytes.fromhex(payload_hex)
+                    timestamp = parse_movella_timestamp(payload)
+                except Exception as exc:
+                    print(f"IGNORING JSON NOTIFICATION: parse failed address={address}: {exc}")
+                    return
+
                 self.stats[address].record_sample(
                     timestamp,
                     time.monotonic(),
@@ -818,49 +872,15 @@ class StreamAttempt:
                     if stable:
                         self.activate_measurement()
 
-                continue
+            return
+        if msg_type == "sensor_disconnected":
+            address = msg.get("address")
+            self.outcome = "retry"
+            self.reason = f"Unexpected disconnect during stream: {address} reason={msg.get('reason')}"
+            raise RuntimeError(self.reason)
 
-            msg: dict[str, Any] = item
-            msg_type = msg.get("type")
-            if msg_type == "notification":
-                address = msg.get("address")
-                characteristic_uuid = str(msg.get("characteristic_uuid", "")).lower()
-
-                if characteristic_uuid == MOVELLA_LONG_PAYLOAD_UUID.lower() and address in self.stats:
-                    payload_hex = msg.get("payload_hex", "")
-
-                    try:
-                        payload = bytes.fromhex(payload_hex)
-                        timestamp = parse_movella_timestamp(payload)
-                    except Exception as exc:
-                        print(f"IGNORING JSON NOTIFICATION: parse failed address={address}: {exc}")
-                        continue
-
-                    print(f"JSON STREAM NOTIFICATION: {address} payload_len={len(payload)}")
-
-                    self.stats[address].record_sample(
-                        timestamp,
-                        time.monotonic(),
-                        self.measurement_active,
-                        self.args.startup_gap_grace_seconds,
-                    )
-
-                    if self.args.use_startup_gate and not self.measurement_active:
-                        stable, _unstable = self.evaluate_startup_stability()
-                        if stable:
-                            self.activate_measurement()
-
-                continue
-            if msg.get("type") == "sensor_disconnected":
-                address = msg.get("address")
-                self.outcome = "retry"
-                self.reason = f"Unexpected disconnect during stream: {address} reason={msg.get('reason')}"
-                raise RuntimeError(self.reason)
-
-            if msg.get("type") == "error":
-                print("Gateway error while streaming:", msg)
-
-        raise TimeoutError(f"Attempt timed out after {self.args.timeout_seconds}s")
+        if msg_type == "error":
+            print("Gateway error while streaming:", msg)
 
     def evaluate_startup_stability(self):
         unstable: list[str] = []

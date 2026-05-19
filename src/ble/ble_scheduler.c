@@ -46,7 +46,7 @@ static uint8_t g_disconnect_pending_count;
 static gateway_sensor_t g_sensors[GATEWAY_MAX_SENSORS];
 static uint8_t g_sensor_count = 0;
 #define NOTIFICATION_QUEUE_DEPTH 128
-#define NOTIFICATION_FLUSH_BUDGET 2
+#define NOTIFICATION_FLUSH_BUDGET 8
 #define ACTIVE_SUBSCRIPTION_MAX 16
 
 typedef enum {
@@ -611,15 +611,55 @@ int ble_scheduler_gatt_read(
 
 int ble_scheduler_disconnect_all(void)
 {
-    for (uint8_t i = 0; i < g_sensor_count; i++) {
-        if (g_sensors[i].is_connected) {
-            ble_interface_disconnect(g_sensors[i].address);
-        }
-    }
+    int rc = ble_interface_disconnect_all();
 
     g_disconnect_pending_count = 0;
+    g_disconnect_request_id[0] = '\0';
+    g_connect_request_id[0] = '\0';
+    g_active_connect_address[0] = '\0';
+    g_connect_deadline_ms = 0;
+    g_connect_queue_count = 0;
+    g_connect_queue_index = 0;
+    memset(g_connect_queue, 0, sizeof(g_connect_queue));
+    memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+    memset(g_notification_queue, 0, sizeof(g_notification_queue));
+    g_notification_head = 0;
+    g_notification_tail = 0;
+    g_notification_count = 0;
+    g_notification_drop_count = 0;
+    memset(g_active_subscriptions, 0, sizeof(g_active_subscriptions));
     g_state = SCHEDULER_STATE_IDLE;
-    return 0;
+    return rc;
+}
+
+int ble_scheduler_reset_session(void)
+{
+    int rc = ble_interface_disconnect_all();
+
+    ble_interface_reset_state();
+
+    memset(g_sensors, 0, sizeof(g_sensors));
+    g_sensor_count = 0;
+    g_scan_active = false;
+    g_scan_deadline_ms = 0;
+    g_scan_request_id[0] = '\0';
+    g_disconnect_pending_count = 0;
+    g_disconnect_request_id[0] = '\0';
+    g_connect_request_id[0] = '\0';
+    g_active_connect_address[0] = '\0';
+    g_connect_deadline_ms = 0;
+    g_connect_queue_count = 0;
+    g_connect_queue_index = 0;
+    memset(g_connect_queue, 0, sizeof(g_connect_queue));
+    memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+    memset(g_notification_queue, 0, sizeof(g_notification_queue));
+    g_notification_head = 0;
+    g_notification_tail = 0;
+    g_notification_count = 0;
+    g_notification_drop_count = 0;
+    memset(g_active_subscriptions, 0, sizeof(g_active_subscriptions));
+    g_state = SCHEDULER_STATE_IDLE;
+    return rc;
 }
 
 int ble_scheduler_get_status(void)

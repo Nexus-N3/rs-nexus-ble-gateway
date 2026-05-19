@@ -18,6 +18,7 @@ typedef enum {
     GW_CMD_GATT_WRITE,
     GW_CMD_GATT_READ,
     GW_CMD_GET_STATUS,
+    GW_CMD_RESET_SESSION,
 } gateway_command_type_t;
 
 typedef enum {

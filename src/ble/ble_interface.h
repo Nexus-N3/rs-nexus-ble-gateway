@@ -30,6 +30,8 @@ int ble_interface_stop_scan(void);
 
 int ble_interface_connect(const char *address);
 int ble_interface_disconnect(const char *address);
+int ble_interface_disconnect_all(void);
+int ble_interface_reset_state(void);
 
 int ble_interface_discover_gatt(const char *address);
 int ble_interface_subscribe(const char *address, const char *characteristic_uuid);

@@ -14,6 +14,7 @@ typedef struct {
 
 int gateway_interface_init(const gateway_interface_callbacks_t *callbacks);
 int gateway_interface_poll(void);
+int gateway_interface_reset_transport_state(void);
 
 int gateway_interface_send_event(const gateway_event_t *event);
 int gateway_interface_send_frame(const gateway_sensor_frame_t *frame);

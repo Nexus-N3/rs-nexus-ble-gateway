@@ -67,6 +67,7 @@ int ble_scheduler_gatt_read(
     const char *characteristic_uuid
 );
 int ble_scheduler_disconnect_all(void);
+int ble_scheduler_reset_session(void);
 int ble_scheduler_get_status(void);
 
 void ble_scheduler_tick(void);

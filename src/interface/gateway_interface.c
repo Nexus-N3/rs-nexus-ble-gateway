@@ -12,6 +12,7 @@
 
 #include "../hardware/led.h"
 
+#define TX_CHUNK_SIZE 256
 #define RX_LINE_MAX 256
 #define UART_RX_BUF_SIZE 256
 #define TX_CONTROL_RING_SIZE 2048
@@ -49,7 +50,7 @@ typedef enum {
     TX_QUEUE_STREAM,
 } tx_queue_kind_t;
 
-static uint8_t tx_chunk_buf[256];
+static uint8_t tx_chunk_buf[TX_CHUNK_SIZE];
 static volatile bool tx_in_progress;
 static void transport_try_start_tx(void);
 
@@ -600,6 +601,11 @@ static void parse_command_line(const char *line, gateway_command_t *command)
         return;
     }
 
+    if (json_type_is(line, "reset_session")) {
+        command->type = GW_CMD_RESET_SESSION;
+        return;
+    }
+
     if (json_type_is(line, "scan_start")) {
         command->type = GW_CMD_SCAN_START;
         command->timeout_ms = extract_uint32_field(
@@ -833,6 +839,32 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
     if (uart_rx_enable(uart_dev, buf, UART_RX_BUF_SIZE, 5000) != 0) {
         return -1;
     }
+
+    return 0;
+}
+
+int gateway_interface_reset_transport_state(void)
+{
+    unsigned int key;
+
+    if (!device_is_ready(uart_dev)) {
+        return -1;
+    }
+
+    key = irq_lock();
+    rx_len = 0;
+    pending_line_ready = false;
+    pending_line[0] = '\0';
+    tx_control_head = 0;
+    tx_control_tail = 0;
+    tx_control_count = 0;
+    tx_control_drop_count = 0;
+    tx_stream_head = 0;
+    tx_stream_tail = 0;
+    tx_stream_count = 0;
+    tx_stream_drop_count = 0;
+    tx_in_progress = false;
+    irq_unlock(key);
 
     return 0;
 }

@@ -210,6 +210,33 @@ static void on_gateway_command(const gateway_command_t *command)
         }
         break;
 
+    case GW_CMD_RESET_SESSION: {
+        int rc = ble_scheduler_reset_session();
+        if (gateway_interface_reset_transport_state() != 0 && rc == 0) {
+            rc = -1;
+        }
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "reset_session_failed",
+                rc
+            );
+        } else {
+            char line[128];
+            snprintf(
+                line,
+                sizeof(line),
+                "{\"type\":\"reset_session_complete\","
+                "\"request_id\":\"%s\","
+                "\"ok\":true}",
+                command->request_id
+            );
+            gateway_interface_send_json_line(line);
+        }
+        break;
+    }
+
     default:
         gateway_interface_send_error(
             request_id_or_null(command),

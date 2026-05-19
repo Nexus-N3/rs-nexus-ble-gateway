@@ -12,6 +12,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef GATEWAY_ENABLE_GATT_DEBUG
+#define GATEWAY_ENABLE_GATT_DEBUG 0
+#endif
+
 #define BLE_MAX_DISCOVERED_PEERS 32
 
 static ble_interface_callbacks_t g_callbacks;
@@ -75,6 +79,7 @@ static gatt_write_ctx_t g_write_ctx;
 static gatt_read_ctx_t g_read_ctx;
 static gatt_subscribe_ctx_t g_subscribe_ctxs[GATEWAY_MAX_SENSORS];
 
+#if GATEWAY_ENABLE_GATT_DEBUG
 static void emit_gatt_debug(
     const char *phase,
     const char *address,
@@ -112,6 +117,11 @@ static void emit_gatt_debug(
 
     gateway_interface_send_log(line);
 }
+#else
+
+#define emit_gatt_debug(...) do { } while (0)
+
+#endif
 
 static bool parse_advertising_data(
     struct bt_data *data,
@@ -821,7 +831,6 @@ int ble_interface_init(const ble_interface_callbacks_t *callbacks)
 
 int ble_interface_start_scan(uint32_t timeout_ms)
 {
-    //(void)spec;
     ARG_UNUSED(timeout_ms);
 
     if (!g_ble_ready) {
@@ -835,9 +844,8 @@ int ble_interface_start_scan(uint32_t timeout_ms)
     memset(g_known_peers, 0, sizeof(g_known_peers));
 
     struct bt_le_scan_param scan_param = {
-        .type = BT_LE_SCAN_TYPE_ACTIVE, //BT_LE_SCAN_TYPE_PASSIVE,
+        .type = BT_LE_SCAN_TYPE_ACTIVE, 
         .options = BT_LE_SCAN_OPT_FILTER_DUPLICATE,
-        //.options = BT_LE_SCAN_OPT_NONE,
         .interval = BT_GAP_SCAN_FAST_INTERVAL,
         .window = BT_GAP_SCAN_FAST_WINDOW,
     };
@@ -928,10 +936,42 @@ int ble_interface_disconnect(const char *address)
     return bt_conn_disconnect(entry->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 }
 
+int ble_interface_disconnect_all(void)
+{
+    int first_rc = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_conns); i++) {
+        if (!g_active_conns[i].used || g_active_conns[i].conn == NULL) {
+            continue;
+        }
+
+        int rc = bt_conn_disconnect(
+            g_active_conns[i].conn,
+            BT_HCI_ERR_REMOTE_USER_TERM_CONN
+        );
+
+        if (rc != 0 && first_rc == 0) {
+            first_rc = rc;
+        }
+    }
+
+    return first_rc;
+}
+
+int ble_interface_reset_state(void)
+{
+    memset(g_known_peers, 0, sizeof(g_known_peers));
+    memset(g_subscribe_ctxs, 0, sizeof(g_subscribe_ctxs));
+    memset(&g_discover_ctx, 0, sizeof(g_discover_ctx));
+    memset(&g_write_ctx, 0, sizeof(g_write_ctx));
+    memset(&g_read_ctx, 0, sizeof(g_read_ctx));
+    g_scanning = false;
+    return 0;
+}
+
 int ble_interface_discover_gatt(const char *address)
 {
     (void)address;
-    //(void)spec;
 
     /*
      * TODO:
@@ -954,7 +994,6 @@ static uint8_t notify_cb(
     ARG_UNUSED(conn);
 
     if (data == NULL) {
-        //ctx->used = false;
         memset(ctx, 0, sizeof(*ctx));
         return BT_GATT_ITER_STOP;
     }
@@ -1018,19 +1057,6 @@ int ble_interface_subscribe(const char *address, const char *characteristic_uuid
 
     if (rc != 0) {
         emit_gatt_debug(
-            "subscribe_failed_details",
-            address,
-            characteristic_uuid,
-            ccc_handle,
-            bt_gatt_get_mtu(entry->conn),
-            value_handle,
-            rc,
-            false
-        );
-    }
-
-    if (rc != 0) {
-        emit_gatt_debug(
             "subscribe_discover_failed",
             address,
             characteristic_uuid,
@@ -1040,7 +1066,6 @@ int ble_interface_subscribe(const char *address, const char *characteristic_uuid
             rc,
             false
         );
-        //ctx->used = false;
         memset(ctx, 0, sizeof(*ctx));
         return rc;
     }
@@ -1053,7 +1078,6 @@ int ble_interface_subscribe(const char *address, const char *characteristic_uuid
     );
 
     if (rc != 0) {
-        //ctx->used = false;
         memset(ctx, 0, sizeof(*ctx));
         return rc;
     }
@@ -1094,7 +1118,6 @@ int ble_interface_subscribe(const char *address, const char *characteristic_uuid
     );
 
     if (rc != 0) {
-        //ctx->used = false;
         memset(ctx, 0, sizeof(*ctx));
         return rc;
     }
