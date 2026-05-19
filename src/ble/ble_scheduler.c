@@ -33,21 +33,28 @@ buffering
 
 static ble_scheduler_state_t g_state = SCHEDULER_STATE_IDLE;
 static int64_t g_scan_deadline_ms;
+static int64_t g_connect_deadline_ms;
 static bool g_scan_active;
 static char g_scan_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 static char g_disconnect_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
 static char g_connect_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
+static char g_active_connect_address[GATEWAY_MAX_ADDRESS_LEN];
 static char g_connect_queue[GATEWAY_MAX_SENSORS][GATEWAY_MAX_ADDRESS_LEN];
 static uint8_t g_connect_queue_count;
 static uint8_t g_connect_queue_index;
 static uint8_t g_disconnect_pending_count;
 static gateway_sensor_t g_sensors[GATEWAY_MAX_SENSORS];
 static uint8_t g_sensor_count = 0;
+#define NOTIFICATION_QUEUE_DEPTH 128
+#define NOTIFICATION_FLUSH_BUDGET 2
+#define ACTIVE_SUBSCRIPTION_MAX 16
 
 typedef enum {
     GATT_OP_NONE = 0,
     GATT_OP_READ,
     GATT_OP_WRITE,
+    GATT_OP_SUBSCRIBE,
+    GATT_OP_UNSUBSCRIBE,
 } gatt_op_type_t;
 
 typedef struct {
@@ -57,11 +64,38 @@ typedef struct {
     char address[GATEWAY_MAX_ADDRESS_LEN];
     char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
     bool without_response;
+    bool binary_notifications;
     uint16_t payload_len;
     uint8_t payload[GATEWAY_MAX_FRAME_PAYLOAD];
 } pending_gatt_op_t;
 
 static pending_gatt_op_t g_pending_gatt_op;
+
+typedef struct {
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
+    bool binary_notifications;
+    uint8_t sensor_id;
+    uint16_t payload_len;
+    uint8_t payload[GATEWAY_MAX_FRAME_PAYLOAD];
+    uint64_t gateway_time_us;
+} pending_notification_t;
+
+static pending_notification_t g_notification_queue[NOTIFICATION_QUEUE_DEPTH];
+static uint16_t g_notification_head;
+static uint16_t g_notification_tail;
+static uint16_t g_notification_count;
+static uint32_t g_notification_drop_count;
+
+typedef struct {
+    bool used;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
+    bool binary_notifications;
+    uint8_t sensor_id;
+} active_subscription_t;
+
+static active_subscription_t g_active_subscriptions[ACTIVE_SUBSCRIPTION_MAX];
 
 static ble_scheduler_policy_t g_policy = {
     .max_parallel_connects = 1,
@@ -133,6 +167,137 @@ static gateway_sensor_t *ensure_sensor_by_address(const char *address)
     return existing;
 }
 
+static int sensor_id_for_address(const char *address)
+{
+    for (uint8_t i = 0; i < g_sensor_count; i++) {
+        if (strcmp(g_sensors[i].address, address) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void clear_active_subscriptions_for_address(const char *address)
+{
+    if (address == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_subscriptions); i++) {
+        if (g_active_subscriptions[i].used &&
+            strcmp(g_active_subscriptions[i].address, address) == 0) {
+            memset(&g_active_subscriptions[i], 0, sizeof(g_active_subscriptions[i]));
+        }
+    }
+}
+
+static void register_active_subscription(
+    const char *address,
+    const char *characteristic_uuid,
+    bool binary_notifications
+)
+{
+    int sensor_id = sensor_id_for_address(address);
+
+    if (sensor_id < 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_subscriptions); i++) {
+        if (g_active_subscriptions[i].used &&
+            strcmp(g_active_subscriptions[i].address, address) == 0 &&
+            strcmp(g_active_subscriptions[i].characteristic_uuid, characteristic_uuid) == 0) {
+            g_active_subscriptions[i].binary_notifications = binary_notifications;
+            g_active_subscriptions[i].sensor_id = (uint8_t)sensor_id;
+            return;
+        }
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_subscriptions); i++) {
+        if (!g_active_subscriptions[i].used) {
+            memset(&g_active_subscriptions[i], 0, sizeof(g_active_subscriptions[i]));
+            g_active_subscriptions[i].used = true;
+            g_active_subscriptions[i].binary_notifications = binary_notifications;
+            g_active_subscriptions[i].sensor_id = (uint8_t)sensor_id;
+            strncpy(g_active_subscriptions[i].address, address, sizeof(g_active_subscriptions[i].address) - 1);
+            strncpy(
+                g_active_subscriptions[i].characteristic_uuid,
+                characteristic_uuid,
+                sizeof(g_active_subscriptions[i].characteristic_uuid) - 1
+            );
+            return;
+        }
+    }
+}
+
+static active_subscription_t *find_active_subscription(
+    const char *address,
+    const char *characteristic_uuid
+)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_subscriptions); i++) {
+        if (g_active_subscriptions[i].used &&
+            strcmp(g_active_subscriptions[i].address, address) == 0 &&
+            strcmp(g_active_subscriptions[i].characteristic_uuid, characteristic_uuid) == 0) {
+            return &g_active_subscriptions[i];
+        }
+    }
+    return NULL;
+}
+
+static void emit_connect_failure(const char *address, int reason)
+{
+    char line[192];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"sensor_disconnected\","
+        "\"request_id\":\"%s\","
+        "\"address\":\"%s\","
+        "\"reason\":%d}",
+        g_connect_request_id,
+        address != NULL ? address : "",
+        reason
+    );
+
+    gateway_interface_send_json_line(line);
+}
+
+static bool remove_address_from_connect_queue(const char *address)
+{
+    if (address == NULL || address[0] == '\0') {
+        return false;
+    }
+
+    for (uint8_t i = g_connect_queue_index; i < g_connect_queue_count; i++) {
+        if (strcmp(g_connect_queue[i], address) == 0) {
+            for (uint8_t j = i; j + 1 < g_connect_queue_count; j++) {
+                memset(g_connect_queue[j], 0, sizeof(g_connect_queue[j]));
+                strncpy(
+                    g_connect_queue[j],
+                    g_connect_queue[j + 1],
+                    sizeof(g_connect_queue[j]) - 1
+                );
+            }
+
+            g_connect_queue_count--;
+
+            if (g_connect_queue_count < GATEWAY_MAX_SENSORS) {
+                memset(
+                    g_connect_queue[g_connect_queue_count],
+                    0,
+                    sizeof(g_connect_queue[g_connect_queue_count])
+                );
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static int start_next_connect(void)
 {
     int rc;
@@ -145,9 +310,18 @@ static int start_next_connect(void)
     }
 
     g_state = SCHEDULER_STATE_CONNECTING;
+    memset(g_active_connect_address, 0, sizeof(g_active_connect_address));
+    strncpy(
+        g_active_connect_address,
+        g_connect_queue[g_connect_queue_index],
+        sizeof(g_active_connect_address) - 1
+    );
+    g_connect_deadline_ms = k_uptime_get() + GATEWAY_DEFAULT_CONNECT_TIMEOUT_MS;
     rc = ble_interface_connect(g_connect_queue[g_connect_queue_index]);
     if (rc != 0) {
         g_state = SCHEDULER_STATE_FAILED;
+        g_active_connect_address[0] = '\0';
+        g_connect_deadline_ms = 0;
         gateway_interface_send_error(
             g_connect_request_id[0] != '\0' ? g_connect_request_id : NULL,
             rc == -3 ? "sensor_not_found" : "connect_failed",
@@ -165,10 +339,18 @@ int ble_scheduler_init(void)
 {
     memset(g_sensors, 0, sizeof(g_sensors));
     memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+    memset(g_notification_queue, 0, sizeof(g_notification_queue));
+    memset(g_active_subscriptions, 0, sizeof(g_active_subscriptions));
     g_sensor_count = 0;
     g_connect_queue_count = 0;
     g_connect_queue_index = 0;
     g_disconnect_pending_count = 0;
+    g_notification_head = 0;
+    g_notification_tail = 0;
+    g_notification_count = 0;
+    g_notification_drop_count = 0;
+    g_connect_deadline_ms = 0;
+    g_active_connect_address[0] = '\0';
     g_state = SCHEDULER_STATE_IDLE;
     return 0;
 }
@@ -195,6 +377,11 @@ int ble_scheduler_start_scan(const char *request_id, uint32_t timeout_ms)
     g_scan_active = true;
 
     return ble_interface_start_scan(timeout_ms);
+}
+
+int is_scan_active(void)
+{
+    return g_scan_active;
 }
 
 int ble_scheduler_stop_scan(void)
@@ -288,15 +475,47 @@ int ble_scheduler_disconnect_addresses(
 }
 
 int ble_scheduler_subscribe(
-    const char *address,
-    const char *characteristic_uuid
+        const char *request_id,
+        const char *address,
+        const char *characteristic_uuid,
+        bool binary_notifications
 )
 {
     if (address == NULL || characteristic_uuid == NULL) {
         return -1;
     }
 
-    return ble_interface_subscribe(address, characteristic_uuid);
+    if (g_pending_gatt_op.pending) {
+        return -16;
+    }
+
+    memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+
+    g_pending_gatt_op.pending = true;
+    g_pending_gatt_op.type = GATT_OP_SUBSCRIBE;
+    g_pending_gatt_op.binary_notifications = binary_notifications;
+
+    strncpy(
+        g_pending_gatt_op.address,
+        address,
+        sizeof(g_pending_gatt_op.address) - 1
+    );
+
+    strncpy(
+        g_pending_gatt_op.characteristic_uuid,
+        characteristic_uuid,
+        sizeof(g_pending_gatt_op.characteristic_uuid) - 1
+    );
+
+    if (request_id != NULL) {
+        strncpy(
+            g_pending_gatt_op.request_id,
+            request_id,
+            sizeof(g_pending_gatt_op.request_id) - 1
+        );
+    }
+
+    return 0;
 }
 
 int ble_scheduler_unsubscribe(
@@ -413,17 +632,100 @@ int ble_scheduler_get_status(void)
     return 0;
 }
 
+static void flush_notification_queue(uint8_t budget)
+{
+    uint8_t flushed = 0;
+
+    while (g_notification_count > 0 && flushed < budget) {
+        pending_notification_t item;
+        unsigned int key = irq_lock();
+
+        if (g_notification_count == 0) {
+            irq_unlock(key);
+            return;
+        }
+
+        item = g_notification_queue[g_notification_head];
+        memset(&g_notification_queue[g_notification_head], 0, sizeof(g_notification_queue[g_notification_head]));
+        g_notification_head = (uint16_t)((g_notification_head + 1U) % NOTIFICATION_QUEUE_DEPTH);
+        g_notification_count--;
+        irq_unlock(key);
+
+        if (item.binary_notifications) {
+            gateway_interface_send_stream_frame(
+                item.sensor_id,
+                item.payload,
+                item.payload_len,
+                item.gateway_time_us
+            );
+        } else {
+            static const char hex_chars[] = "0123456789ABCDEF";
+            char payload_hex[(GATEWAY_MAX_FRAME_PAYLOAD * 2) + 1];
+            char line[768];
+
+            for (size_t i = 0; i < item.payload_len; i++) {
+                payload_hex[i * 2] = hex_chars[(item.payload[i] >> 4) & 0x0F];
+                payload_hex[i * 2 + 1] = hex_chars[item.payload[i] & 0x0F];
+            }
+            payload_hex[item.payload_len * 2] = '\0';
+
+            snprintf(
+                line,
+                sizeof(line),
+                "{\"type\":\"notification\","
+                "\"address\":\"%s\","
+                "\"characteristic_uuid\":\"%s\","
+                "\"payload_hex\":\"%s\","
+                "\"payload_len\":%u,"
+                "\"gateway_timestamp_us\":%llu}",
+                item.address,
+                item.characteristic_uuid,
+                payload_hex,
+                (unsigned int)item.payload_len,
+                (unsigned long long)item.gateway_time_us
+            );
+            gateway_interface_send_json_line(line);
+        }
+        flushed++;
+    }
+}
+
 void ble_scheduler_tick(void)
 {
+    bool handled_gatt_op = false;
+
     if (g_scan_active && k_uptime_get() >= g_scan_deadline_ms) {
         ble_scheduler_stop_scan();
     }
 
-    if (!g_pending_gatt_op.pending) {
+    if (g_state == SCHEDULER_STATE_CONNECTING &&
+        g_active_connect_address[0] != '\0' &&
+        g_connect_deadline_ms > 0 &&
+        k_uptime_get() >= g_connect_deadline_ms) {
+        char timed_out_address[GATEWAY_MAX_ADDRESS_LEN];
+
+        strncpy(
+            timed_out_address,
+            g_active_connect_address,
+            sizeof(timed_out_address) - 1
+        );
+        timed_out_address[sizeof(timed_out_address) - 1] = '\0';
+
+        (void)ble_interface_disconnect(timed_out_address);
+        emit_connect_failure(timed_out_address, -110);
+
+        g_active_connect_address[0] = '\0';
+        g_connect_deadline_ms = 0;
+
+        if (remove_address_from_connect_queue(timed_out_address)) {
+            start_next_connect();
+        }
+
         return;
     }
 
-    if (g_pending_gatt_op.type == GATT_OP_READ) {
+    
+    if (g_pending_gatt_op.pending && g_pending_gatt_op.type == GATT_OP_READ) {
         uint8_t buffer[GATEWAY_MAX_FRAME_PAYLOAD];
         size_t data_len = sizeof(buffer);
         int rc = ble_interface_read(
@@ -463,7 +765,9 @@ void ble_scheduler_tick(void)
             );
             gateway_interface_send_json_line(line);
         }
-    } else if (g_pending_gatt_op.type == GATT_OP_WRITE) {
+        memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+        handled_gatt_op = true;
+    } else if (g_pending_gatt_op.pending && g_pending_gatt_op.type == GATT_OP_WRITE) {
         int rc = ble_interface_write(
             g_pending_gatt_op.address,
             g_pending_gatt_op.characteristic_uuid,
@@ -491,9 +795,57 @@ void ble_scheduler_tick(void)
             );
             gateway_interface_send_json_line(line);
         }
+        memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+        handled_gatt_op = true;
+    } else if (g_pending_gatt_op.pending && g_pending_gatt_op.type == GATT_OP_SUBSCRIBE) {
+        int rc = ble_interface_subscribe(
+            g_pending_gatt_op.address,
+            g_pending_gatt_op.characteristic_uuid
+        );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                g_pending_gatt_op.request_id[0] != '\0'
+                    ? g_pending_gatt_op.request_id
+                    : NULL,
+                "subscribe_failed",
+                rc
+            );
+        } else {
+            char line[256];
+
+            snprintf(
+                line,
+                sizeof(line),
+                "{\"type\":\"subscribe_complete\","
+                "\"request_id\":\"%s\","
+                "\"address\":\"%s\","
+                "\"sensor_id\":%u,"
+                "\"characteristic_uuid\":\"%s\","
+                "\"ok\":true}",
+                g_pending_gatt_op.request_id,
+                g_pending_gatt_op.address,
+                (unsigned int)sensor_id_for_address(g_pending_gatt_op.address),
+                g_pending_gatt_op.characteristic_uuid
+            );
+
+            register_active_subscription(
+                g_pending_gatt_op.address,
+                g_pending_gatt_op.characteristic_uuid,
+                g_pending_gatt_op.binary_notifications
+            );
+            gateway_interface_send_json_line(line);
+        }
+
+        memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+        handled_gatt_op = true;
     }
 
-    memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+    if (handled_gatt_op) {
+        return;
+    }
+
+    flush_notification_queue(NOTIFICATION_FLUSH_BUDGET);
 }
 
 void ble_scheduler_on_sensor_found(const ble_discovered_sensor_t *found)
@@ -533,8 +885,10 @@ void ble_scheduler_on_connected(const char *address, uint16_t conn_handle)
         sizeof(line),
         "{\"type\":\"sensor_connected\","
         "\"request_id\":\"%s\","
+        "\"sensor_id\":%u,"
         "\"address\":\"%s\"}",
         g_connect_request_id,
+        (unsigned int)sensor_id_for_address(address),
         address != NULL ? address : ""
     );
 
@@ -543,6 +897,10 @@ void ble_scheduler_on_connected(const char *address, uint16_t conn_handle)
     if (g_connect_queue_count > 0 &&
         g_connect_queue_index < g_connect_queue_count &&
         strcmp(g_connect_queue[g_connect_queue_index], address) == 0) {
+        if (strcmp(g_active_connect_address, address) == 0) {
+            g_active_connect_address[0] = '\0';
+            g_connect_deadline_ms = 0;
+        }
         g_connect_queue_index++;
         start_next_connect();
     }
@@ -556,6 +914,7 @@ void ble_scheduler_on_disconnected(const char *address, int reason)
         sensor->is_connected = false;
         sensor->is_streaming = false;
     }
+    clear_active_subscriptions_for_address(address);
 
     char line[192];
     const char *request_id =
@@ -576,16 +935,26 @@ void ble_scheduler_on_disconnected(const char *address, int reason)
     );
     gateway_interface_send_json_line(line);
 
+    if (strcmp(g_active_connect_address, address) == 0) {
+        g_active_connect_address[0] = '\0';
+        g_connect_deadline_ms = 0;
+    }
+
     if (g_disconnect_pending_count > 0) {
         g_disconnect_pending_count--;
         if (g_disconnect_pending_count == 0) {
             g_disconnect_request_id[0] = '\0';
         }
     } else if (g_connect_queue_count > 0 &&
-               g_connect_queue_index < g_connect_queue_count &&
-               strcmp(g_connect_queue[g_connect_queue_index], address) == 0) {
-        g_connect_queue_index++;
-        start_next_connect();
+            g_connect_queue_index < g_connect_queue_count) {
+        if (strcmp(g_connect_queue[g_connect_queue_index], address) == 0) {
+            g_connect_queue_index++;
+            start_next_connect();
+        } else if (remove_address_from_connect_queue(address)) {
+            start_next_connect();
+        } else {
+            g_disconnect_request_id[0] = '\0';
+        }
     } else {
         g_disconnect_request_id[0] = '\0';
     }
@@ -593,36 +962,44 @@ void ble_scheduler_on_disconnected(const char *address, int reason)
 
 void ble_scheduler_on_notification(
     const char *address,
+    const char *characteristic_uuid,
     const uint8_t *payload,
     size_t payload_len,
     uint64_t gateway_time_us
 )
 {
-    gateway_sensor_t *sensor = find_sensor_by_address(address);
-    if (sensor == NULL || payload == NULL) {
+    pending_notification_t *slot;
+    unsigned int key;
+    active_subscription_t *subscription;
+
+    if (address == NULL || characteristic_uuid == NULL || payload == NULL) {
         return;
     }
-
-    sensor->frames_received++;
-    sensor->last_frame_gateway_time_us = gateway_time_us;
-    if (sensor->first_frame_gateway_time_us == 0) {
-        sensor->first_frame_gateway_time_us = gateway_time_us;
-    }
-
-    gateway_sensor_frame_t frame;
-    memset(&frame, 0, sizeof(frame));
-
-    strncpy(frame.address, address, sizeof(frame.address) - 1);
-    frame.sensor_type = sensor->sensor_type;
-    frame.gateway_time_us = gateway_time_us;
-    frame.sequence = sensor->frames_received;
 
     if (payload_len > GATEWAY_MAX_FRAME_PAYLOAD) {
         payload_len = GATEWAY_MAX_FRAME_PAYLOAD;
     }
 
-    frame.payload_len = (uint16_t)payload_len;
-    memcpy(frame.payload, payload, payload_len);
+    subscription = find_active_subscription(address, characteristic_uuid);
 
-    gateway_interface_send_frame(&frame);
+    key = irq_lock();
+    if (g_notification_count >= NOTIFICATION_QUEUE_DEPTH) {
+        g_notification_drop_count++;
+        irq_unlock(key);
+        return;
+    }
+
+    slot = &g_notification_queue[g_notification_tail];
+    memset(slot, 0, sizeof(*slot));
+    strncpy(slot->address, address, sizeof(slot->address) - 1);
+    strncpy(slot->characteristic_uuid, characteristic_uuid, sizeof(slot->characteristic_uuid) - 1);
+    slot->binary_notifications = subscription != NULL ? subscription->binary_notifications : false;
+    slot->sensor_id = subscription != NULL ? subscription->sensor_id : 0xFF;
+    slot->payload_len = (uint16_t)payload_len;
+    memcpy(slot->payload, payload, payload_len);
+    slot->gateway_time_us = gateway_time_us;
+
+    g_notification_tail = (uint16_t)((g_notification_tail + 1U) % NOTIFICATION_QUEUE_DEPTH);
+    g_notification_count++;
+    irq_unlock(key);
 }

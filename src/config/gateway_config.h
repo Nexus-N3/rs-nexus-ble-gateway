@@ -1,3 +1,4 @@
+//this is not in the build so not used probably
 #pragma once
 
 #define GATEWAY_MAX_SENSORS              10

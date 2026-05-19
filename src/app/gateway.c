@@ -2,6 +2,7 @@
 #include "../interface/gateway_interface.h"
 #include "../ble/ble_interface.h"
 #include "../ble/ble_scheduler.h"
+#include "../hardware/led.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -47,6 +48,9 @@ static void on_gateway_command(const gateway_command_t *command)
         break;
 
     case GW_CMD_SCAN_START:
+        // turn on scan led
+        led_on(APP_LED_SCAN);
+
         ble_scheduler_start_scan(
             request_id_or_null(command),
             command->timeout_ms
@@ -54,10 +58,19 @@ static void on_gateway_command(const gateway_command_t *command)
         break;
 
     case GW_CMD_SCAN_STOP:
-        ble_scheduler_stop_scan();
+        // turn off scan led
+        bool rc = is_scan_active();
+        if(rc){
+            led_off(APP_LED_SCAN);
+            ble_scheduler_stop_scan();
+        }
         break;
 
     case GW_CMD_CONNECT_ADDRESSES: {
+        //scan may not be stopped? 
+        led_off(APP_LED_SCAN);
+        ble_scheduler_stop_scan();
+
         int rc = ble_scheduler_connect_addresses(
             request_id_or_null(command),
             command->sensors,
@@ -94,12 +107,59 @@ static void on_gateway_command(const gateway_command_t *command)
 }
 
     case GW_CMD_SUBSCRIBE:
-        send_not_implemented(command, "subscribe");
+    {
+        int rc = ble_scheduler_subscribe(
+            request_id_or_null(command),
+            command->address,
+            command->characteristic_uuid,
+            command->binary_notifications
+        );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "subscribe_failed",
+                rc
+            );
+        }
+
         break;
+    }
 
     case GW_CMD_UNSUBSCRIBE:
-        send_not_implemented(command, "unsubscribe");
+    {
+        int rc = ble_scheduler_unsubscribe(
+            command->address,
+            command->characteristic_uuid
+        );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "unsubscribe_failed",
+                rc
+            );
+        } else {
+            char line[256];
+
+            snprintf(
+                line,
+                sizeof(line),
+                "{\"type\":\"unsubscribe_complete\","
+                "\"request_id\":\"%s\","
+                "\"address\":\"%s\","
+                "\"characteristic_uuid\":\"%s\","
+                "\"ok\":true}",
+                command->request_id,
+                command->address,
+                command->characteristic_uuid
+            );
+
+            gateway_interface_send_json_line(line);
+        }
+
         break;
+    }
 
     case GW_CMD_GATT_WRITE:
     {
@@ -160,6 +220,9 @@ static void on_gateway_command(const gateway_command_t *command)
     }
 }
 
+//callbacks for BLE events, which simply forward the events to the BLE scheduler. 
+//The scheduler will handle the events and update its internal state accordingly.
+
 static void on_ble_sensor_found(const ble_discovered_sensor_t *sensor)
 {
     ble_scheduler_on_sensor_found(sensor);
@@ -177,12 +240,13 @@ static void on_ble_disconnected(const char *address, int reason)
 
 static void on_ble_notification(
     const char *address,
+    const char *characteristic_uuid,
     const uint8_t *payload,
     size_t payload_len,
     uint64_t gateway_time_us
 )
 {
-    ble_scheduler_on_notification(address, payload, payload_len, gateway_time_us);
+    ble_scheduler_on_notification(address, characteristic_uuid, payload, payload_len, gateway_time_us);
 }
 
 int gateway_app_init(void)

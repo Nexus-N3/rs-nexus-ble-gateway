@@ -13,9 +13,7 @@
 #include "../hardware/led.h"
 
 #define RX_LINE_MAX 256
-#define UART_RX_BUF_SIZE 256
-#define TX_CONTROL_RING_SIZE 2048
-#define TX_STREAM_RING_SIZE 16384
+#define TX_RING_SIZE 8192
 
 static const struct device *uart_dev =
     DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
@@ -27,220 +25,68 @@ static size_t rx_len;
 
 static char pending_line[RX_LINE_MAX];
 static volatile bool pending_line_ready;
-static uint8_t uart_rx_buf_a[UART_RX_BUF_SIZE];
-static uint8_t uart_rx_buf_b[UART_RX_BUF_SIZE];
-static bool uart_rx_buf_a_in_use;
-static bool uart_rx_buf_b_in_use;
 
-static uint8_t tx_control_ring[TX_CONTROL_RING_SIZE];
-static volatile size_t tx_control_head;
-static volatile size_t tx_control_tail;
-static volatile size_t tx_control_count;
-static volatile uint32_t tx_control_drop_count;
+static uint8_t tx_ring[TX_RING_SIZE];
+static volatile size_t tx_head;
+static volatile size_t tx_tail;
+static volatile size_t tx_count;
+static volatile uint32_t tx_drop_count;
 
-static uint8_t tx_stream_ring[TX_STREAM_RING_SIZE];
-static volatile size_t tx_stream_head;
-static volatile size_t tx_stream_tail;
-static volatile size_t tx_stream_count;
-static volatile uint32_t tx_stream_drop_count;
-
-typedef enum {
-    TX_QUEUE_CONTROL = 0,
-    TX_QUEUE_STREAM,
-} tx_queue_kind_t;
-
-static uint8_t tx_chunk_buf[256];
-static volatile bool tx_in_progress;
-static void transport_try_start_tx(void);
-
-static void process_rx_bytes(const uint8_t *buf, size_t len)
+static void tx_kick(void)
 {
-    for (size_t i = 0; i < len; i++) {
-        unsigned char c = buf[i];
-
-        if (c == '\r') {
-            continue;
-        }
-
-        if (c == '\n') {
-            rx_line[rx_len] = '\0';
-
-            if (rx_len > 0 && !pending_line_ready) {
-                memcpy(pending_line, rx_line, rx_len + 1);
-                pending_line_ready = true;
-            }
-
-            rx_len = 0;
-            continue;
-        }
-
-        if (rx_len < RX_LINE_MAX - 1) {
-            rx_line[rx_len++] = (char)c;
-        } else {
-            rx_len = 0;
-        }
-    }
+    uart_irq_tx_enable(uart_dev);
 }
 
-static int tx_enqueue_bytes(
-    tx_queue_kind_t queue_kind,
-    const uint8_t *data,
-    size_t len
-)
+static int tx_enqueue_byte(uint8_t byte)
 {
-    uint8_t *ring;
-    volatile size_t *tail;
-    volatile size_t *count;
-    size_t ring_size;
-    volatile uint32_t *drop_count;
+    unsigned int key = irq_lock();
 
+    if (tx_count >= TX_RING_SIZE) {
+        tx_drop_count++;
+        irq_unlock(key);
+        return -1;
+    }
+
+    tx_ring[tx_tail] = byte;
+    tx_tail = (tx_tail + 1U) % TX_RING_SIZE;
+    tx_count++;
+
+    irq_unlock(key);
+    tx_kick();
+    return 0;
+}
+
+static int tx_enqueue_bytes(const uint8_t *data, size_t len)
+{
     if (data == NULL) {
         return -1;
     }
 
-    if (queue_kind == TX_QUEUE_CONTROL) {
-        ring = tx_control_ring;
-        tail = &tx_control_tail;
-        count = &tx_control_count;
-        ring_size = TX_CONTROL_RING_SIZE;
-        drop_count = &tx_control_drop_count;
-    } else {
-        ring = tx_stream_ring;
-        tail = &tx_stream_tail;
-        count = &tx_stream_count;
-        ring_size = TX_STREAM_RING_SIZE;
-        drop_count = &tx_stream_drop_count;
-    }
-
-    unsigned int key = irq_lock();
-
-    if ((ring_size - *count) < len) {
-        *drop_count += 1U;
-        irq_unlock(key);
-        return -12;
-    }
-
     for (size_t i = 0; i < len; i++) {
-        ring[*tail] = data[i];
-        *tail = (*tail + 1U) % ring_size;
+        if (tx_enqueue_byte(data[i]) != 0) {
+            return -1;
+        }
     }
 
-    *count += len;
-    irq_unlock(key);
-
-    transport_try_start_tx();
     return 0;
 }
 
-static int transport_write_str(tx_queue_kind_t queue_kind, const char *s)
+static void transport_write_str(const char *s)
 {
     if (s == NULL) {
-        return -1;
-    }
-
-    return tx_enqueue_bytes(
-        queue_kind,
-        (const uint8_t *)s,
-        strlen(s)
-    );
-}
-
-static int transport_write_bytes(
-    tx_queue_kind_t queue_kind,
-    const uint8_t *data,
-    size_t len
-)
-{
-    return tx_enqueue_bytes(queue_kind, data, len);
-}
-
-static int tx_dequeue_into_buf(
-    uint8_t *buf,
-    size_t buf_size,
-    tx_queue_kind_t *queue_kind_out
-)
-{
-    size_t len = 0;
-    unsigned int key = irq_lock();
-
-    if (tx_control_count > 0) {
-        if (queue_kind_out != NULL) {
-            *queue_kind_out = TX_QUEUE_CONTROL;
-        }
-        while (tx_control_count > 0 && len < buf_size) {
-            buf[len++] = tx_control_ring[tx_control_head];
-            tx_control_head = (tx_control_head + 1U) % TX_CONTROL_RING_SIZE;
-            tx_control_count--;
-        }
-    } else {
-        if (queue_kind_out != NULL) {
-            *queue_kind_out = TX_QUEUE_STREAM;
-        }
-        while (tx_stream_count > 0 && len < buf_size) {
-            buf[len++] = tx_stream_ring[tx_stream_head];
-            tx_stream_head = (tx_stream_head + 1U) % TX_STREAM_RING_SIZE;
-            tx_stream_count--;
-        }
-    }
-
-    irq_unlock(key);
-    return (int)len;
-}
-
-static void mark_rx_buf_free(const uint8_t *buf)
-{
-    if (buf == uart_rx_buf_a) {
-        uart_rx_buf_a_in_use = false;
-    } else if (buf == uart_rx_buf_b) {
-        uart_rx_buf_b_in_use = false;
-    }
-}
-
-static uint8_t *claim_rx_buf(void)
-{
-    if (!uart_rx_buf_a_in_use) {
-        uart_rx_buf_a_in_use = true;
-        return uart_rx_buf_a;
-    }
-
-    if (!uart_rx_buf_b_in_use) {
-        uart_rx_buf_b_in_use = true;
-        return uart_rx_buf_b;
-    }
-
-    return NULL;
-}
-
-static void transport_try_start_tx(void)
-{
-    int len;
-
-    if (!device_is_ready(uart_dev)) {
         return;
     }
 
-    unsigned int key = irq_lock();
-    if (tx_in_progress) {
-        irq_unlock(key);
-        return;
+    while (*s != '\0') {
+        if (tx_enqueue_byte((uint8_t)*s++) != 0) {
+            return;
+        }
     }
-    tx_in_progress = true;
-    irq_unlock(key);
+}
 
-    len = tx_dequeue_into_buf(tx_chunk_buf, sizeof(tx_chunk_buf), NULL);
-    if (len <= 0) {
-        key = irq_lock();
-        tx_in_progress = false;
-        irq_unlock(key);
-        return;
-    }
-
-    int rc = uart_tx(uart_dev, tx_chunk_buf, len, SYS_FOREVER_US);
-    if (rc != 0) {
-        key = irq_lock();
-        tx_in_progress = false;
-        irq_unlock(key);
-    }
+static void transport_write_bytes(const uint8_t *data, size_t len)
+{
+    (void)tx_enqueue_bytes(data, len);
 }
 
 int gateway_interface_send_scan_result(
@@ -744,57 +590,62 @@ static void parse_command_line(const char *line, gateway_command_t *command)
     }
 }
 
-static void uart_cb(
-    const struct device *dev,
-    struct uart_event *evt,
-    void *user_data
-)
+static void uart_cb(const struct device *dev, void *user_data)
 {
     ARG_UNUSED(user_data);
 
-    switch (evt->type) {
-    case UART_TX_DONE:
-    case UART_TX_ABORTED: {
+    while (uart_irq_update(dev) && uart_irq_rx_ready(dev)) {
+        uint8_t buf[32];
+        int len = uart_fifo_read(dev, buf, sizeof(buf));
+
+        for (int i = 0; i < len; i++) {
+            unsigned char c = buf[i];
+
+            if (c == '\r') {
+                continue;
+            }
+
+            if (c == '\n') {
+                rx_line[rx_len] = '\0';
+
+                if (rx_len > 0 && !pending_line_ready) {
+                    memcpy(pending_line, rx_line, rx_len + 1);
+                    pending_line_ready = true;
+                }
+
+                rx_len = 0;
+                continue;
+            }
+
+            if (rx_len < RX_LINE_MAX - 1) {
+                rx_line[rx_len++] = (char)c;
+            } else {
+                rx_len = 0;
+            }
+        }
+    }
+
+    while (uart_irq_update(dev) && uart_irq_tx_ready(dev)) {
+        uint8_t buf[64];
+        int len = 0;
         unsigned int key = irq_lock();
-        tx_in_progress = false;
+
+        while (tx_count > 0 && len < (int)sizeof(buf)) {
+            buf[len++] = tx_ring[tx_head];
+            tx_head = (tx_head + 1U) % TX_RING_SIZE;
+            tx_count--;
+        }
+
         irq_unlock(key);
-        transport_try_start_tx();
-        break;
-    }
 
-    case UART_RX_RDY:
-        process_rx_bytes(
-            &evt->data.rx.buf[evt->data.rx.offset],
-            evt->data.rx.len
-        );
-        break;
-
-    case UART_RX_BUF_REQUEST: {
-        uint8_t *buf = claim_rx_buf();
-        if (buf != NULL) {
-            (void)uart_rx_buf_rsp(dev, buf, UART_RX_BUF_SIZE);
+        if (len > 0) {
+            (void)uart_fifo_fill(dev, buf, len);
         }
-        break;
-    }
 
-    case UART_RX_BUF_RELEASED:
-        mark_rx_buf_free(evt->data.rx_buf.buf);
-        break;
-
-    case UART_RX_DISABLED: {
-        uint8_t *buf = claim_rx_buf();
-        if (buf != NULL) {
-            (void)uart_rx_enable(dev, buf, UART_RX_BUF_SIZE, 5000);
+        if (tx_count == 0) {
+            uart_irq_tx_disable(dev);
+            break;
         }
-        break;
-    }
-
-    case UART_RX_STOPPED:
-        (void)uart_rx_disable(dev);
-        break;
-
-    default:
-        break;
     }
 }
 
@@ -808,31 +659,13 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
         return -1;
     }
 
-    tx_control_head = 0;
-    tx_control_tail = 0;
-    tx_control_count = 0;
-    tx_control_drop_count = 0;
-    tx_stream_head = 0;
-    tx_stream_tail = 0;
-    tx_stream_count = 0;
-    tx_stream_drop_count = 0;
+    tx_head = 0;
+    tx_tail = 0;
+    tx_count = 0;
+    tx_drop_count = 0;
 
-    uart_rx_buf_a_in_use = false;
-    uart_rx_buf_b_in_use = false;
-    tx_in_progress = false;
-
-    if (uart_callback_set(uart_dev, uart_cb, NULL) != 0) {
-        return -1;
-    }
-
-    uint8_t *buf = claim_rx_buf();
-    if (buf == NULL) {
-        return -1;
-    }
-
-    if (uart_rx_enable(uart_dev, buf, UART_RX_BUF_SIZE, 5000) != 0) {
-        return -1;
-    }
+    uart_irq_callback_user_data_set(uart_dev, uart_cb, NULL);
+    uart_irq_rx_enable(uart_dev);
 
     return 0;
 }
@@ -843,8 +676,6 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
 int gateway_interface_poll(void)
 {
     char line[RX_LINE_MAX];
-
-    transport_try_start_tx();
 
     if (!pending_line_ready) {
         return 0;
@@ -1040,13 +871,8 @@ int gateway_interface_send_json_line(const char *json)
         return -1;
     }
 
-    if (transport_write_str(TX_QUEUE_CONTROL, json) != 0) {
-        return -12;
-    }
-
-    if (transport_write_str(TX_QUEUE_CONTROL, "\n") != 0) {
-        return -12;
-    }
+    transport_write_str(json);
+    transport_write_str("\n");
 
     return 0;
 }
@@ -1058,35 +884,38 @@ int gateway_interface_send_stream_frame(
     uint64_t gateway_timestamp_us
 )
 {
-    uint8_t frame[13 + GATEWAY_MAX_FRAME_PAYLOAD + 1];
-    size_t index = 0;
+    uint8_t header[13];
     uint8_t checksum = 0;
 
-    if (payload == NULL) {
+    if (payload == NULL || payload_len > GATEWAY_MAX_FRAME_PAYLOAD) {
         return -1;
     }
 
-    if (payload_len > GATEWAY_MAX_FRAME_PAYLOAD) {
-        payload_len = GATEWAY_MAX_FRAME_PAYLOAD;
+    header[0] = 0xA5;
+    header[1] = 0x5A;
+    header[2] = 0x01;
+    header[3] = sensor_id;
+    header[4] = (uint8_t)(gateway_timestamp_us & 0xFF);
+    header[5] = (uint8_t)((gateway_timestamp_us >> 8) & 0xFF);
+    header[6] = (uint8_t)((gateway_timestamp_us >> 16) & 0xFF);
+    header[7] = (uint8_t)((gateway_timestamp_us >> 24) & 0xFF);
+    header[8] = (uint8_t)((gateway_timestamp_us >> 32) & 0xFF);
+    header[9] = (uint8_t)((gateway_timestamp_us >> 40) & 0xFF);
+    header[10] = (uint8_t)((gateway_timestamp_us >> 48) & 0xFF);
+    header[11] = (uint8_t)((gateway_timestamp_us >> 56) & 0xFF);
+    header[12] = (uint8_t)payload_len;
+
+    for (size_t i = 2; i < sizeof(header); i++) {
+        checksum = (uint8_t)(checksum + header[i]);
     }
 
-    frame[index++] = 0xA5;
-    frame[index++] = 0x5A;
-    frame[index++] = 0x01;
-    frame[index++] = sensor_id;
-
-    for (int i = 0; i < 8; i++) {
-        frame[index++] = (uint8_t)((gateway_timestamp_us >> (8 * i)) & 0xFF);
+    for (uint16_t i = 0; i < payload_len; i++) {
+        checksum = (uint8_t)(checksum + payload[i]);
     }
 
-    frame[index++] = (uint8_t)payload_len;
-    memcpy(&frame[index], payload, payload_len);
-    index += payload_len;
+    transport_write_bytes(header, sizeof(header));
+    transport_write_bytes(payload, payload_len);
+    transport_write_bytes(&checksum, 1);
 
-    for (size_t i = 2; i < index; i++) {
-        checksum = (uint8_t)(checksum + frame[i]);
-    }
-
-    frame[index++] = checksum;
-    return transport_write_bytes(TX_QUEUE_STREAM, frame, index);
+    return 0;
 }

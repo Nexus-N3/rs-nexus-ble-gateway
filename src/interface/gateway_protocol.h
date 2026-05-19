@@ -52,6 +52,7 @@ typedef struct {
     char request_id[GATEWAY_MAX_REQUEST_ID_LEN];
     uint32_t timeout_ms;
     bool without_response;
+    bool binary_notifications;
     char address[GATEWAY_MAX_ADDRESS_LEN];
     char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
     uint8_t payload[GATEWAY_MAX_FRAME_PAYLOAD];

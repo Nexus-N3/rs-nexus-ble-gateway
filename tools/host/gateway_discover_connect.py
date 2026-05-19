@@ -4,12 +4,92 @@ import argparse
 import json
 import time
 from typing import List, Tuple
-
+from dataclasses import dataclass
 import serial
 
+@dataclass
+class GatewayStreamStats:
+    address: str
+    expected_rate_hz: float
+    stream_start_command_time: float | None = None
+    first_packet_wall_time: float | None = None
+    first_gateway_time_us: int | None = None
+    last_gateway_time_us: int | None = None
+    first_sensor_timestamp: int | None = None
+    last_sensor_timestamp: int | None = None
+    first_wall_time: float | None = None
+    last_wall_time: float | None = None
+    packets_received: int = 0
+    gap_events: int = 0
+    estimated_dropped_packets: int = 0
+
+    @property
+    def expected_delta_us(self):
+        if self.expected_rate_hz <= 0:
+            return None
+        return 1_000_000.0 / self.expected_rate_hz
+
+    @property
+    def duration_seconds(self):
+        if self.first_wall_time is None or self.last_wall_time is None:
+            return 0.0
+        return max(self.last_wall_time - self.first_wall_time, 0.0)
+
+    @property
+    def observed_rate_hz(self):
+        duration = self.duration_seconds
+        if duration <= 0:
+            return 0.0
+        return self.packets_received / duration
+
+    @property
+    def time_to_first_packet_ms(self):
+        if self.stream_start_command_time is None or self.first_packet_wall_time is None:
+            return None
+        return max(
+            (self.first_packet_wall_time - self.stream_start_command_time) * 1000.0,
+            0.0,
+        )
+
+    def record_packet(self, sensor_timestamp, gateway_time_us, wall_time):
+        if self.first_packet_wall_time is None:
+            self.first_packet_wall_time = wall_time
+
+        if self.first_wall_time is None:
+            self.first_wall_time = wall_time
+            self.first_gateway_time_us = gateway_time_us
+            self.first_sensor_timestamp = sensor_timestamp
+        else:
+            self._record_gap_if_needed(sensor_timestamp)
+
+        self.last_wall_time = wall_time
+        self.last_gateway_time_us = gateway_time_us
+        self.last_sensor_timestamp = sensor_timestamp
+        self.packets_received += 1
+
+    def _record_gap_if_needed(self, sensor_timestamp):
+        if sensor_timestamp is None or self.last_sensor_timestamp is None:
+            return
+
+        expected_delta_us = self.expected_delta_us
+        if expected_delta_us is None:
+            return
+
+        observed_delta_us = sensor_timestamp - self.last_sensor_timestamp
+
+        if observed_delta_us <= int(expected_delta_us * 1.5):
+            return
+
+        missing_packets = max(int(round(observed_delta_us / expected_delta_us)) - 1, 0)
+
+        if missing_packets <= 0:
+            return
+
+        self.gap_events += 1
+        self.estimated_dropped_packets += missing_packets
 
 DEFAULT_PORT = "/dev/serial/by-id/usb-SEGGER_J-Link_001057755524-if02"
-BAUD = 115200
+BAUD = 1000000
 MOVELLA_NAME = "Movella DOT"
 MOVELLA_UUID_HINTS = {
     "15173001-4947-11e9-8646-d663bd873d93",
@@ -22,7 +102,10 @@ MOVELLA_UUID_HINTS = {
 }
 MOVELLA_DEVICE_CONTROL_UUID = "15171002-4947-11e9-8646-d663bd873d93"
 MOVELLA_IDENTIFY_HEX = "010102"
-
+MOVELLA_BATTERY_UUID = "15173001-4947-11e9-8646-d663bd873d93"
+MOVELLA_START_STOP_STREAM_UUID = "15172001-4947-11e9-8646-d663bd873d93"
+MOVELLA_START_HEX = "01011A"
+MOVELLA_STOP_HEX = "01001A"
 
 def disconnect_addresses(ser, addresses, timeout_s=10):
     request_id = f"disconnect_{int(time.time() * 1000)}"
@@ -158,6 +241,45 @@ def gatt_read_address(
 
     raise TimeoutError(f"Timed out waiting for gatt_read on {address}")
 
+def gatt_subscribe_address(
+    ser,
+    address,
+    characteristic_uuid,
+    timeout_s=10,
+):
+    request_id = f"subscribe_{int(time.time() * 1000)}"
+
+    send_jsonl(
+        ser,
+        {
+            "type": "subscribe",
+            "request_id": request_id,
+            "address": address,
+            "characteristic_uuid": characteristic_uuid,
+        },
+    )
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        msg = read_json_any(ser, timeout_s=max(0.1, deadline - time.time()))
+        msg_type = msg.get("type")
+
+        if msg_type == "subscribe_complete" and msg.get("request_id") == request_id:
+            print(
+                f"SUBSCRIBE COMPLETE: {address} uuid={characteristic_uuid}"
+            )
+            return True
+
+        if msg_type == "error" and msg.get("request_id") == request_id:
+            raise RuntimeError(
+                f"Gateway subscribe failed: {msg.get('message')} "
+                f"({msg.get('error_code')})"
+            )
+
+        print("Ignoring JSON message:")
+        print(json.dumps(msg, indent=2))
+
+    raise TimeoutError(f"Timed out waiting for subscribe on {address}")
 
 def identify_address(ser, address, args):
     last_error = None
@@ -206,6 +328,29 @@ def identify_address(ser, address, args):
 
     raise RuntimeError(f"Identify failed for {address}: {last_error}")
 
+def start_stream_address(ser, address, args):
+    print(f"START STREAM: {address}")
+    return gatt_write_address(
+        ser,
+        address,
+        MOVELLA_START_STOP_STREAM_UUID,
+        MOVELLA_START_HEX,
+        without_response=args.without_response,
+        timeout_s=args.write_timeout_s,
+    )
+
+
+def stop_stream_address(ser, address, args):
+    print(f"STOP STREAM: {address}")
+    return gatt_write_address(
+        ser,
+        address,
+        MOVELLA_START_STOP_STREAM_UUID,
+        MOVELLA_STOP_HEX,
+        without_response=args.without_response,
+        timeout_s=args.write_timeout_s,
+    )
+
 
 def match_sensor_name(
     local_name: str,
@@ -237,6 +382,19 @@ def normalize_uuids(service_uuids):
         return []
     return [str(uuid).lower() for uuid in service_uuids if uuid]
 
+def parse_battery_percent(payload_hex):
+    if not payload_hex:
+        return None
+
+    try:
+        data = bytes.fromhex(payload_hex)
+    except ValueError:
+        return None
+
+    if not data:
+        return None
+
+    return data[0]
 
 def match_movella(msg, names_sorted, names_sorted_lower):
     matched_name = match_sensor_name(
@@ -427,13 +585,20 @@ def connect_addresses(
 
             msg_type = msg.get("type")
 
-            if msg_type == "sensor_connected" and msg.get("request_id") == request_id:
+            if msg_type == "sensor_connected":
                 address = msg.get("address")
                 if address in pending:
                     pending.remove(address)
                     if address not in connected:
                         connected.append(address)
-                    print(f"CONNECTED: {address}")
+                    event_request_id = msg.get("request_id")
+                    if event_request_id != request_id:
+                        print(
+                            f"CONNECTED: {address} "
+                            f"(late/stale request_id={event_request_id}, current={request_id})"
+                        )
+                    else:
+                        print(f"CONNECTED: {address}")
                 continue
 
             if msg_type == "sensor_disconnected" and msg.get("request_id") == request_id:
@@ -487,13 +652,13 @@ def add_connect_retry_args(parser):
     parser.add_argument(
         "--connect-attempt-timeout-s",
         type=float,
-        default=2.0,
+        default=20.0,
         help="Seconds to wait for a connect attempt before retrying pending sensors.",
     )
     parser.add_argument(
         "--connect-retry-attempts",
         type=int,
-        default=1,
+        default=0,
         help="Number of retry attempts after the initial connect attempt.",
     )
     parser.add_argument(
@@ -641,6 +806,130 @@ def run_auto_connect_disconnect(args):
             )
         )
 
+def run_battery(args):
+    with open_gateway_serial(args.port) as ser:
+        command_hello(ser)
+
+        if args.count is not None:
+            matches = discover_movella(ser, timeout_ms=args.timeout_ms)
+            selected = select_discovered_addresses(matches, args.count)
+            addresses = selected
+            print(f"AUTO-BATTERY addresses: {addresses}")
+        else:
+            addresses = list(args.address)
+
+            if not args.skip_discover:
+                matches = discover_movella(ser, timeout_ms=args.timeout_ms)
+                matched_addresses = {entry["address"] for entry in matches}
+                missing = [
+                    address for address in addresses
+                    if address not in matched_addresses
+                ]
+
+                if missing:
+                    raise RuntimeError(
+                        "Requested addresses were not found in current Movella scan: "
+                        + ", ".join(missing)
+                    )
+
+        connected = connect_addresses(
+            ser,
+            addresses,
+            attempt_timeout_s=args.connect_attempt_timeout_s,
+            retry_attempts=args.connect_retry_attempts,
+            retry_delay_s=args.connect_retry_delay_s,
+        )
+
+        if not connected:
+            raise RuntimeError(f"Failed to connect to: {', '.join(addresses)}")
+
+        for address in connected:
+            gatt_subscribe_address(
+                ser,
+                address,
+                MOVELLA_BATTERY_UUID,
+                timeout_s=args.subscribe_timeout_s,
+            )
+
+            payload_hex = gatt_read_address(
+                ser,
+                address,
+                MOVELLA_BATTERY_UUID,
+                timeout_s=args.read_timeout_s,
+            )
+
+            battery_percent = parse_battery_percent(payload_hex)
+            if battery_percent is None:
+                print(
+                    f"INITIAL BATTERY: {address} "
+                    f"payload_hex={payload_hex} could not parse"
+                )
+            else:
+                print(f"INITIAL BATTERY: {address} {battery_percent}%")
+
+        deadline = time.time() + args.listen_s
+        print(f"Listening for battery notifications for {args.listen_s:.1f}s...")
+
+        while time.time() < deadline:
+            try:
+                msg = read_json_any(
+                    ser,
+                    timeout_s=max(0.1, deadline - time.time()),
+                )
+            except TimeoutError:
+                break
+
+            msg_type = msg.get("type")
+
+            if msg_type == "notification":
+                address = msg.get("address")
+                characteristic_uuid = str(
+                    msg.get("characteristic_uuid", "")
+                ).lower()
+
+                if characteristic_uuid != MOVELLA_BATTERY_UUID.lower():
+                    print("Ignoring non-battery notification:")
+                    print(json.dumps(msg, indent=2))
+                    continue
+
+                payload_hex = msg.get("payload_hex", "")
+                battery_percent = parse_battery_percent(payload_hex)
+
+                if battery_percent is None:
+                    print(
+                        f"BATTERY NOTIFICATION: {address} "
+                        f"payload_hex={payload_hex} could not parse"
+                    )
+                else:
+                    print(f"BATTERY NOTIFICATION: {address} {battery_percent}%")
+                continue
+
+            if msg_type == "error":
+                print("Gateway error while listening:")
+                print(json.dumps(msg, indent=2))
+                continue
+
+            print("Ignoring JSON message:")
+            print(json.dumps(msg, indent=2))
+
+        if args.disconnect:
+            disconnected = disconnect_addresses(
+                ser,
+                connected,
+                timeout_s=args.disconnect_timeout_s,
+            )
+        else:
+            disconnected = []
+
+        print(
+            json.dumps(
+                {
+                    "connected": connected,
+                    "disconnected": disconnected,
+                },
+                indent=2,
+            )
+        )
 
 def run_identify(args):
     with open_gateway_serial(args.port) as ser:
@@ -871,7 +1160,68 @@ def main():
     )
     auto_identify_parser.set_defaults(func=run_auto_identify)
 
+    battery_parser = subparsers.add_parser(
+    "battery",
+    help="Connect explicit sensor addresses, subscribe to battery notifications, read initial battery, then listen.",
+)
+    battery_parser.add_argument(
+        "--address",
+        action="append",
+        default=[],
+        help="BLE address to test battery for. Repeat for multiple sensors.",
+    )
+    battery_parser.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help="Scan for Movella DOT sensors and test the first N matches.",
+    )
+    battery_parser.add_argument("--timeout-ms", type=int, default=5000)
+    battery_parser.add_argument(
+        "--skip-discover",
+        action="store_true",
+        help="Skip the pre-connect discovery pass.",
+    )
+    add_connect_retry_args(battery_parser)
+    battery_parser.add_argument(
+        "--subscribe-timeout-s",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for subscribe_complete.",
+    )
+    battery_parser.add_argument(
+        "--read-timeout-s",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for the initial battery read.",
+    )
+    battery_parser.add_argument(
+        "--listen-s",
+        type=float,
+        default=30.0,
+        help="Seconds to listen for battery notification events.",
+    )
+    battery_parser.add_argument(
+        "--disconnect-timeout-s",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for disconnect confirmation.",
+    )
+    battery_parser.add_argument(
+        "--disconnect",
+        action="store_true",
+        help="Disconnect after the battery test finishes.",
+    )
+    battery_parser.set_defaults(func=run_battery)
+
     args = parser.parse_args()
+    if args.command == "battery":
+        if args.count is None and not args.address:
+            parser.error("battery requires either --count N or at least one --address")
+        if args.count is not None and args.address:
+            parser.error("battery accepts either --count N or --address, not both")
+        if args.count is not None and args.skip_discover:
+            parser.error("battery --count requires discovery, so do not use --skip-discover")
     try:
         args.func(args)
     except (TimeoutError, RuntimeError) as exc:

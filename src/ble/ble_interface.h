@@ -10,6 +10,7 @@ typedef void (*ble_connected_cb_t)(const char *address, uint16_t conn_handle);
 typedef void (*ble_disconnected_cb_t)(const char *address, int reason);
 typedef void (*ble_notification_cb_t)(
     const char *address,
+    const char *characteristic_uuid,
     const uint8_t *payload,
     size_t payload_len,
     uint64_t gateway_time_us
