@@ -106,6 +106,150 @@ static uint32_t extract_uint32_field(
     return (uint32_t)strtoul(p, NULL, 10);
 }
 
+static bool extract_bool_field(
+    const char *line,
+    const char *field_name,
+    bool default_value
+)
+{
+    char key[48];
+    const char *p;
+
+    snprintf(key, sizeof(key), "\"%s\"", field_name);
+
+    p = strstr(line, key);
+    if (p == NULL) {
+        return default_value;
+    }
+
+    p = strchr(p, ':');
+    if (p == NULL) {
+        return default_value;
+    }
+
+    p++;
+
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    if (strncmp(p, "true", 4) == 0) {
+        return true;
+    }
+
+    if (strncmp(p, "false", 5) == 0) {
+        return false;
+    }
+
+    return default_value;
+}
+
+static void extract_string_field(
+    const char *line,
+    const char *field_name,
+    char *out,
+    size_t out_size
+)
+{
+    char key[48];
+    const char *p;
+    const char *end;
+    size_t len;
+
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+
+    snprintf(key, sizeof(key), "\"%s\"", field_name);
+    p = strstr(line, key);
+    if (p == NULL) {
+        return;
+    }
+
+    p = strchr(p, ':');
+    if (p == NULL) {
+        return;
+    }
+
+    p++;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    if (*p != '"') {
+        return;
+    }
+
+    p++;
+    end = strchr(p, '"');
+    if (end == NULL) {
+        return;
+    }
+
+    len = (size_t)(end - p);
+    if (len >= out_size) {
+        len = out_size - 1;
+    }
+
+    memcpy(out, p, len);
+    out[len] = '\0';
+}
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (c - 'a');
+    }
+    if (c >= 'A' && c <= 'F') {
+        return 10 + (c - 'A');
+    }
+    return -1;
+}
+
+static void extract_hex_payload_field(
+    const char *line,
+    const char *field_name,
+    uint8_t *out,
+    uint16_t *out_len,
+    uint16_t max_len
+)
+{
+    char hex[2 * GATEWAY_MAX_FRAME_PAYLOAD + 1];
+    size_t hex_len;
+    uint16_t byte_len = 0;
+
+    if (out == NULL || out_len == NULL) {
+        return;
+    }
+
+    *out_len = 0;
+    extract_string_field(line, field_name, hex, sizeof(hex));
+
+    hex_len = strlen(hex);
+    if (hex_len == 0 || (hex_len % 2) != 0) {
+        return;
+    }
+
+    for (size_t i = 0; i + 1 < hex_len && byte_len < max_len; i += 2) {
+        int hi = hex_nibble(hex[i]);
+        int lo = hex_nibble(hex[i + 1]);
+
+        if (hi < 0 || lo < 0) {
+            *out_len = 0;
+            return;
+        }
+
+        out[byte_len++] = (uint8_t)((hi << 4) | lo);
+    }
+
+    *out_len = byte_len;
+}
+
 static void extract_request_id(const char *line, char *out, size_t out_size)
 {
     const char *key = "\"request_id\"";
@@ -306,21 +450,81 @@ static void parse_command_line(const char *line, gateway_command_t *command)
 
     if (json_type_is(line, "subscribe")) {
         command->type = GW_CMD_SUBSCRIBE;
+        extract_string_field(
+            line,
+            "address",
+            command->address,
+            sizeof(command->address)
+        );
+        extract_string_field(
+            line,
+            "characteristic_uuid",
+            command->characteristic_uuid,
+            sizeof(command->characteristic_uuid)
+        );
         return;
     }
 
     if (json_type_is(line, "unsubscribe")) {
         command->type = GW_CMD_UNSUBSCRIBE;
+        extract_string_field(
+            line,
+            "address",
+            command->address,
+            sizeof(command->address)
+        );
+        extract_string_field(
+            line,
+            "characteristic_uuid",
+            command->characteristic_uuid,
+            sizeof(command->characteristic_uuid)
+        );
         return;
     }
 
     if (json_type_is(line, "gatt_write")) {
         command->type = GW_CMD_GATT_WRITE;
+        extract_string_field(
+            line,
+            "address",
+            command->address,
+            sizeof(command->address)
+        );
+        extract_string_field(
+            line,
+            "characteristic_uuid",
+            command->characteristic_uuid,
+            sizeof(command->characteristic_uuid)
+        );
+        command->without_response = extract_bool_field(
+            line,
+            "without_response",
+            false
+        );
+        extract_hex_payload_field(
+            line,
+            "payload_hex",
+            command->payload,
+            &command->payload_len,
+            sizeof(command->payload)
+        );
         return;
     }
 
     if (json_type_is(line, "gatt_read")) {
         command->type = GW_CMD_GATT_READ;
+        extract_string_field(
+            line,
+            "address",
+            command->address,
+            sizeof(command->address)
+        );
+        extract_string_field(
+            line,
+            "characteristic_uuid",
+            command->characteristic_uuid,
+            sizeof(command->characteristic_uuid)
+        );
         return;
     }
 }

@@ -4,7 +4,10 @@
 #include "../ble/ble_scheduler.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
+
+// Helper function to get the request ID from a command, or return NULL if it's not set.
 static const char *request_id_or_null(const gateway_command_t *command)
 {
     if (command == NULL || command->request_id[0] == '\0') {
@@ -14,6 +17,7 @@ static const char *request_id_or_null(const gateway_command_t *command)
     return command->request_id;
 }
 
+// Helper function to send a "not implemented" error for a given command and command name.
 static void send_not_implemented(
     const gateway_command_t *command,
     const char *command_name
@@ -25,6 +29,7 @@ static void send_not_implemented(
     );
 }
 
+// Main handler for incoming gateway commands. This function is called by the gateway interface
 static void on_gateway_command(const gateway_command_t *command)
 {
 
@@ -97,12 +102,43 @@ static void on_gateway_command(const gateway_command_t *command)
         break;
 
     case GW_CMD_GATT_WRITE:
-        send_not_implemented(command, "gatt_write");
+    {
+        int rc = ble_scheduler_gatt_write(
+                request_id_or_null(command),
+                command->address,
+                command->characteristic_uuid,
+                command->payload,
+                command->payload_len,
+                command->without_response
+            );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "gatt_write_failed",
+                rc
+            );
+        }
         break;
+    }
 
     case GW_CMD_GATT_READ:
-        send_not_implemented(command, "gatt_read");
+    {
+        int rc = ble_scheduler_gatt_read(
+            request_id_or_null(command),
+            command->address,
+            command->characteristic_uuid
+        );
+
+        if (rc != 0) {
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "gatt_read_failed",
+                rc
+            );
+        }
         break;
+    }
 
     case GW_CMD_DISCONNECT_ALL:
         if (ble_scheduler_disconnect_all() != 0) {

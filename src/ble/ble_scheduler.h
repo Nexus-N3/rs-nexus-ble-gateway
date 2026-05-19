@@ -51,6 +51,7 @@ int ble_scheduler_unsubscribe(
     const char *characteristic_uuid
 );
 int ble_scheduler_gatt_write(
+    const char *request_id,
     const char *address,
     const char *characteristic_uuid,
     const uint8_t *data,
@@ -58,6 +59,7 @@ int ble_scheduler_gatt_write(
     bool without_response
 );
 int ble_scheduler_gatt_read(
+    const char *request_id,
     const char *address,
     const char *characteristic_uuid
 );
