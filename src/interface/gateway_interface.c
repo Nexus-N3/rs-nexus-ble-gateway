@@ -962,9 +962,6 @@ int gateway_interface_reset_transport_state(void)
     return 0;
 }
 
-//This function should be called periodically from the main loop to process incoming commands. 
-//It checks if a complete line of input has been received, parses it as a command, and 
-//invokes the appropriate callback.
 int gateway_interface_poll(void)
 {
     char line[RX_LINE_MAX];
@@ -990,7 +987,6 @@ int gateway_interface_poll(void)
     gateway_command_t command;
     parse_command_line(line, &command);
 
-    // Invoike the callback that is listening on gateway.c
     if (g_callbacks.on_command != NULL) {
         g_callbacks.on_command(&command);
     }

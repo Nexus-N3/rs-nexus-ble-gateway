@@ -356,7 +356,6 @@ class GatewayClient:
     def get_status(
         self,
         timeout_s: float = 10.0,
-        expected_addresses: list[str] | None = None,
     ):
         request_id = f"status_{int(time.time() * 1000)}"
         saw_status = False
@@ -900,7 +899,7 @@ class StreamAttempt:
                     expected_rate_hz=self.args.sampling_rate_hz,
                 )
 
-            # wait for connetion stability before configuring
+            # Wait for connection stability before configuring.
             if self.args.post_connect_settle_seconds > 0:
                 print(
                     "All sensors connected. "
@@ -922,7 +921,6 @@ class StreamAttempt:
                 try:
                     self.client.get_status(
                         timeout_s=10.0,
-                        expected_addresses=self.connected,
                     )
                 except TimeoutError as exc:
                     self.status_warning = str(exc)

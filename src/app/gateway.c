@@ -6,9 +6,6 @@
 
 #include <stddef.h>
 #include <stdio.h>
-
-
-// Helper function to get the request ID from a command, or return NULL if it's not set.
 static const char *request_id_or_null(const gateway_command_t *command)
 {
     if (command == NULL || command->request_id[0] == '\0') {
@@ -18,10 +15,8 @@ static const char *request_id_or_null(const gateway_command_t *command)
     return command->request_id;
 }
 
-// Main handler for incoming gateway commands. This function is called by the gateway interface
 static void on_gateway_command(const gateway_command_t *command)
 {
-
     if (command == NULL) {
         return;
     }
@@ -38,7 +33,6 @@ static void on_gateway_command(const gateway_command_t *command)
         break;
 
     case GW_CMD_SCAN_START:
-        // turn on scan led
         led_on(APP_LED_SCAN);
 
         ble_scheduler_start_scan(
@@ -48,16 +42,14 @@ static void on_gateway_command(const gateway_command_t *command)
         break;
 
     case GW_CMD_SCAN_STOP:
-        // turn off scan led
         bool rc = is_scan_active();
-        if(rc){
+        if (rc) {
             led_off(APP_LED_SCAN);
             ble_scheduler_stop_scan();
         }
         break;
 
     case GW_CMD_CONNECT_ADDRESSES: {
-        //scan may not be stopped? 
         led_off(APP_LED_SCAN);
         ble_scheduler_stop_scan();
 

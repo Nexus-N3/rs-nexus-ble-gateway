@@ -44,7 +44,6 @@ typedef struct {
 } notification_rx_stats_t;
 
 static notification_rx_stats_t g_notification_rx_stats[GATEWAY_MAX_SENSORS];
-static uint64_t g_next_notification_rx_stats_report_us;
 
 typedef enum {
     GATT_OP_NONE = 0,
@@ -94,10 +93,13 @@ typedef struct {
 
 static active_subscription_t g_active_subscriptions[ACTIVE_SUBSCRIPTION_MAX];
 
-#define MOVELLA_EXPECTED_DELTA_US 16667U
-#define MOVELLA_GAP_THRESHOLD_US 25000U
-#define MOVELLA_MAX_COUNTED_GAP_US 1000000U
-#define NOTIFICATION_RX_STATS_REPORT_INTERVAL_US 1000000ULL
+/*
+ * Current gap estimation assumes the first 4 payload bytes encode a little-endian
+ * sensor timestamp in microseconds with an expected cadence close to 60 Hz.
+ */
+#define SENSOR_TIMESTAMP_EXPECTED_DELTA_US 16667U
+#define SENSOR_TIMESTAMP_GAP_THRESHOLD_US 25000U
+#define SENSOR_TIMESTAMP_MAX_COUNTED_GAP_US 1000000U
 
 static notification_rx_stats_t *find_or_alloc_notification_rx_stats(
     const char *address
@@ -177,18 +179,18 @@ static void update_notification_rx_stats(
     delta_us = timestamp_us - previous_timestamp_us;
     stats->last_sensor_timestamp_us = timestamp_us;
 
-    if (delta_us <= MOVELLA_GAP_THRESHOLD_US) {
+    if (delta_us <= SENSOR_TIMESTAMP_GAP_THRESHOLD_US) {
         return;
     }
 
-    if (delta_us > MOVELLA_MAX_COUNTED_GAP_US) {
+    if (delta_us > SENSOR_TIMESTAMP_MAX_COUNTED_GAP_US) {
         stats->timestamp_discontinuity_events++;
         return;
     }
 
     missing_packets =
-        (delta_us + (MOVELLA_EXPECTED_DELTA_US / 2U)) /
-        MOVELLA_EXPECTED_DELTA_US;
+        (delta_us + (SENSOR_TIMESTAMP_EXPECTED_DELTA_US / 2U)) /
+        SENSOR_TIMESTAMP_EXPECTED_DELTA_US;
 
     if (missing_packets > 0U) {
         missing_packets -= 1U;
@@ -203,16 +205,6 @@ static void update_notification_rx_stats(
 }
 
 
-
-__maybe_unused static ble_scheduler_policy_t g_policy = {
-    .max_parallel_connects = 1,
-    .connect_gap_ms = 500,
-    .post_connect_settle_ms = 5000,
-    .startup_health_window_ms = GATEWAY_HEALTH_WINDOW_MS,
-    .min_rate_hz = GATEWAY_MIN_HEALTH_RATE_HZ,
-    .stagger_connections = true,
-    .stagger_stream_start = false,
-};
 
 static gateway_sensor_t *find_sensor_by_address(const char *address)
 {
@@ -450,7 +442,6 @@ int ble_scheduler_init(void)
     memset(g_notification_queue, 0, sizeof(g_notification_queue));
     memset(g_active_subscriptions, 0, sizeof(g_active_subscriptions));
 
-    g_next_notification_rx_stats_report_us = 0;
     g_sensor_count = 0;
     g_connect_queue_count = 0;
     g_connect_queue_index = 0;
