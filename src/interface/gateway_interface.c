@@ -13,7 +13,7 @@
 #include "../hardware/led.h"
 
 #define TX_CHUNK_SIZE 256
-#define RX_LINE_MAX 512 //256
+#define RX_LINE_MAX 512 //do not increase this 1024 squashes connect on 9 sensors and drain on lower than 9
 #define UART_RX_BUF_SIZE 256
 #define TX_CONTROL_RING_SIZE 8192
 #define TX_STREAM_RING_SIZE 16384
