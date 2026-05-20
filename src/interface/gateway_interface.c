@@ -13,7 +13,7 @@
 #include "../hardware/led.h"
 
 #define TX_CHUNK_SIZE 256
-#define RX_LINE_MAX 256
+#define RX_LINE_MAX 512 //256
 #define UART_RX_BUF_SIZE 256
 #define TX_CONTROL_RING_SIZE 8192
 #define TX_STREAM_RING_SIZE 16384
@@ -964,7 +964,7 @@ int gateway_interface_reset_transport_state(void)
 
 int gateway_interface_poll(void)
 {
-    char line[RX_LINE_MAX];
+    static char line[RX_LINE_MAX];
 
     transport_try_start_tx();
 
