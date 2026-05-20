@@ -13,7 +13,7 @@
 #include "../hardware/led.h"
 
 #define TX_CHUNK_SIZE 256
-#define RX_LINE_MAX 256
+#define RX_LINE_MAX 512 //256
 #define UART_RX_BUF_SIZE 256
 #define TX_CONTROL_RING_SIZE 8192
 #define TX_STREAM_RING_SIZE 16384
@@ -962,12 +962,9 @@ int gateway_interface_reset_transport_state(void)
     return 0;
 }
 
-//This function should be called periodically from the main loop to process incoming commands. 
-//It checks if a complete line of input has been received, parses it as a command, and 
-//invokes the appropriate callback.
 int gateway_interface_poll(void)
 {
-    char line[RX_LINE_MAX];
+    static char line[RX_LINE_MAX];
 
     transport_try_start_tx();
 
@@ -990,7 +987,6 @@ int gateway_interface_poll(void)
     gateway_command_t command;
     parse_command_line(line, &command);
 
-    // Invoike the callback that is listening on gateway.c
     if (g_callbacks.on_command != NULL) {
         g_callbacks.on_command(&command);
     }

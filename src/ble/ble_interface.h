@@ -50,6 +50,7 @@ int ble_interface_write(
 );
 
 int ble_interface_get_rssi(const char *address, int8_t *rssi_out);
+uint8_t ble_interface_active_connection_count(void);
 
 /*
  * Optional tuning hooks. Some stacks expose these, some do not.
@@ -61,5 +62,3 @@ int ble_interface_request_connection_params(
     uint16_t latency,
     uint16_t supervision_timeout_units
 );
-
-void ble_scheduler_report_notification_rx_stats(const char *request_id);

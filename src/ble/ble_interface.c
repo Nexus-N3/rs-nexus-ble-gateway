@@ -25,6 +25,8 @@
 #define BLE_CONN_MAX_INTERVAL_UNITS 24   
 #define BLE_CONN_LATENCY 0
 #define BLE_CONN_SUPERVISION_TIMEOUT_UNITS 400 /* 4 s */
+#define GATT_HANDLE_CACHE_SIZE (GATEWAY_MAX_SENSORS * 4)
+
 
 static const struct bt_le_conn_param g_ble_conn_param = {
     .interval_min = BLE_CONN_MIN_INTERVAL_UNITS,
@@ -86,13 +88,23 @@ typedef struct {
     bool mtu_exchange_in_progress;
 } active_conn_t;
 
-static active_conn_t g_active_conns[GATEWAY_MAX_SENSORS];
+typedef struct {
+    bool used;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
+    uint16_t value_handle;
+    uint16_t ccc_handle;
+    bool has_value_handle;
+    bool has_ccc_handle;
+} gatt_handle_cache_t;
 
+static active_conn_t g_active_conns[GATEWAY_MAX_SENSORS];
 static known_peer_t g_known_peers[BLE_MAX_DISCOVERED_PEERS];
 static gatt_discover_ctx_t g_discover_ctx;
 static gatt_write_ctx_t g_write_ctx;
 static gatt_read_ctx_t g_read_ctx;
 static gatt_subscribe_ctx_t g_subscribe_ctxs[GATEWAY_MAX_SENSORS];
+static gatt_handle_cache_t g_handle_cache[GATT_HANDLE_CACHE_SIZE];
 
 #if GATEWAY_ENABLE_GATT_DEBUG
 static void emit_gatt_debug(
@@ -576,6 +588,134 @@ static uint8_t read_complete_cb(
     return BT_GATT_ITER_CONTINUE;
 }
 
+static gatt_handle_cache_t *find_handle_cache_entry(
+    const char *address,
+    const char *characteristic_uuid
+)
+{
+    if (address == NULL || characteristic_uuid == NULL) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_handle_cache); i++) {
+        if (g_handle_cache[i].used &&
+            strcmp(g_handle_cache[i].address, address) == 0 &&
+            strcmp(g_handle_cache[i].characteristic_uuid, characteristic_uuid) == 0) {
+            return &g_handle_cache[i];
+        }
+    }
+
+    return NULL;
+}
+
+static gatt_handle_cache_t *get_or_alloc_handle_cache_entry(
+    const char *address,
+    const char *characteristic_uuid
+)
+{
+    gatt_handle_cache_t *entry;
+
+    if (address == NULL || characteristic_uuid == NULL) {
+        return NULL;
+    }
+
+    entry = find_handle_cache_entry(address, characteristic_uuid);
+    if (entry != NULL) {
+        return entry;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_handle_cache); i++) {
+        if (!g_handle_cache[i].used) {
+            memset(&g_handle_cache[i], 0, sizeof(g_handle_cache[i]));
+            g_handle_cache[i].used = true;
+
+            strncpy(
+                g_handle_cache[i].address,
+                address,
+                sizeof(g_handle_cache[i].address) - 1
+            );
+
+            strncpy(
+                g_handle_cache[i].characteristic_uuid,
+                characteristic_uuid,
+                sizeof(g_handle_cache[i].characteristic_uuid) - 1
+            );
+
+            return &g_handle_cache[i];
+        }
+    }
+
+    return NULL;
+}
+
+static bool get_cached_value_handle(
+    const char *address,
+    const char *characteristic_uuid,
+    uint16_t *value_handle_out
+)
+{
+    gatt_handle_cache_t *entry =
+        find_handle_cache_entry(address, characteristic_uuid);
+
+    if (entry == NULL || !entry->has_value_handle || value_handle_out == NULL) {
+        return false;
+    }
+
+    *value_handle_out = entry->value_handle;
+    return true;
+}
+
+static bool get_cached_ccc_handle(
+    const char *address,
+    const char *characteristic_uuid,
+    uint16_t *ccc_handle_out
+)
+{
+    gatt_handle_cache_t *entry =
+        find_handle_cache_entry(address, characteristic_uuid);
+
+    if (entry == NULL || !entry->has_ccc_handle || ccc_handle_out == NULL) {
+        return false;
+    }
+
+    *ccc_handle_out = entry->ccc_handle;
+    return true;
+}
+
+static void put_cached_value_handle(
+    const char *address,
+    const char *characteristic_uuid,
+    uint16_t value_handle
+)
+{
+    gatt_handle_cache_t *entry =
+        get_or_alloc_handle_cache_entry(address, characteristic_uuid);
+
+    if (entry == NULL || value_handle == 0) {
+        return;
+    }
+
+    entry->value_handle = value_handle;
+    entry->has_value_handle = true;
+}
+
+static void put_cached_ccc_handle(
+    const char *address,
+    const char *characteristic_uuid,
+    uint16_t ccc_handle
+)
+{
+    gatt_handle_cache_t *entry =
+        get_or_alloc_handle_cache_entry(address, characteristic_uuid);
+
+    if (entry == NULL || ccc_handle == 0) {
+        return;
+    }
+
+    entry->ccc_handle = ccc_handle;
+    entry->has_ccc_handle = true;
+}
+
 static int discover_characteristic_handle(
     struct bt_conn *conn,
     const char *characteristic_uuid,
@@ -886,6 +1026,7 @@ int ble_interface_init(const ble_interface_callbacks_t *callbacks)
         return 0;
     }
 
+    memset(g_handle_cache, 0, sizeof(g_handle_cache));
     memset(g_subscribe_ctxs, 0, sizeof(g_subscribe_ctxs));
 
     int rc = bt_enable(NULL);
@@ -1034,6 +1175,7 @@ int ble_interface_reset_state(void)
     memset(&g_discover_ctx, 0, sizeof(g_discover_ctx));
     memset(&g_write_ctx, 0, sizeof(g_write_ctx));
     memset(&g_read_ctx, 0, sizeof(g_read_ctx));
+    memset(g_handle_cache, 0, sizeof(g_handle_cache));
     g_scanning = false;
     return 0;
 }
@@ -1118,37 +1260,45 @@ int ble_interface_subscribe(const char *address, const char *characteristic_uuid
         return -12;
     }
 
+    if (!get_cached_value_handle(address, characteristic_uuid, &value_handle)) {
     rc = discover_characteristic_handle(
-        entry->conn,
-        characteristic_uuid,
-        &value_handle
-    );
-
-    if (rc != 0) {
-        emit_gatt_debug(
-            "subscribe_discover_failed",
-            address,
+            entry->conn,
             characteristic_uuid,
-            0,
-            bt_gatt_get_mtu(entry->conn),
-            0,
-            rc,
-            false
+            &value_handle
         );
-        memset(ctx, 0, sizeof(*ctx));
-        return rc;
+
+        if (rc != 0) {
+            emit_gatt_debug(
+                "subscribe_discover_failed",
+                address,
+                characteristic_uuid,
+                0,
+                bt_gatt_get_mtu(entry->conn),
+                0,
+                rc,
+                false
+            );
+            memset(ctx, 0, sizeof(*ctx));
+            return rc;
+        }
+
+        put_cached_value_handle(address, characteristic_uuid, value_handle);
     }
 
-    rc = discover_ccc_handle(
-        entry->conn,
-        characteristic_uuid,
-        value_handle,
-        &ccc_handle
-    );
+    if (!get_cached_ccc_handle(address, characteristic_uuid, &ccc_handle)) {
+        rc = discover_ccc_handle(
+            entry->conn,
+            characteristic_uuid,
+            value_handle,
+            &ccc_handle
+        );
 
-    if (rc != 0) {
-        memset(ctx, 0, sizeof(*ctx));
-        return rc;
+        if (rc != 0) {
+            memset(ctx, 0, sizeof(*ctx));
+            return rc;
+        }
+
+        put_cached_ccc_handle(address, characteristic_uuid, ccc_handle);
     }
 
     memset(&ctx->params, 0, sizeof(ctx->params));
@@ -1315,19 +1465,28 @@ int ble_interface_write(
         return -3;
     }
 
-    rc = discover_characteristic_handle(entry->conn, characteristic_uuid, &handle);
-    if (rc != 0) {
-        emit_gatt_debug(
-            "write_discover_failed",
-            address,
+    if (!get_cached_value_handle(address, characteristic_uuid, &handle)) {
+        rc = discover_characteristic_handle(
+            entry->conn,
             characteristic_uuid,
-            0,
-            bt_gatt_get_mtu(entry->conn),
-            data_len,
-            rc,
-            without_response
+            &handle
         );
-        return rc;
+
+        if (rc != 0) {
+            emit_gatt_debug(
+                "write_discover_failed",
+                address,
+                characteristic_uuid,
+                0,
+                bt_gatt_get_mtu(entry->conn),
+                data_len,
+                rc,
+                without_response
+            );
+            return rc;
+        }
+
+        put_cached_value_handle(address, characteristic_uuid, handle);
     }
 
     emit_gatt_debug(
@@ -1421,6 +1580,19 @@ int ble_interface_get_rssi(const char *address, int8_t *rssi_out)
     }
 
     return -2;
+}
+
+uint8_t ble_interface_active_connection_count(void)
+{
+    uint8_t count = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_conns); i++) {
+        if (g_active_conns[i].used && g_active_conns[i].conn != NULL) {
+            count++;
+        }
+    }
+
+    return count;
 }
 
 int ble_interface_request_connection_params(
