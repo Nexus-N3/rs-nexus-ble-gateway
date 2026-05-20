@@ -32,6 +32,7 @@ int ble_scheduler_init(void);
 
 int ble_scheduler_start_scan(const char *request_id, uint32_t timeout_ms);
 int ble_scheduler_stop_scan(void);
+int is_scan_active(void);
 int ble_scheduler_connect_addresses(
     const char *request_id,
     const gateway_connect_sensor_t *sensors,
@@ -43,8 +44,10 @@ int ble_scheduler_disconnect_addresses(
     uint8_t address_count
 );
 int ble_scheduler_subscribe(
+    const char *request_id,
     const char *address,
-    const char *characteristic_uuid
+    const char *characteristic_uuid,
+    bool binary_notifications
 );
 int ble_scheduler_unsubscribe(
     const char *address,
@@ -64,6 +67,7 @@ int ble_scheduler_gatt_read(
     const char *characteristic_uuid
 );
 int ble_scheduler_disconnect_all(void);
+int ble_scheduler_reset_session(void);
 int ble_scheduler_get_status(void);
 
 void ble_scheduler_tick(void);
@@ -76,7 +80,9 @@ void ble_scheduler_on_connected(const char *address, uint16_t conn_handle);
 void ble_scheduler_on_disconnected(const char *address, int reason);
 void ble_scheduler_on_notification(
     const char *address,
+    const char *characteristic_uuid,
     const uint8_t *payload,
     size_t payload_len,
     uint64_t gateway_time_us
 );
+void ble_scheduler_report_notification_rx_stats(const char *request_id);

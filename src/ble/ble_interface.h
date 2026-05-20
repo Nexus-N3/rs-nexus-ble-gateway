@@ -10,6 +10,7 @@ typedef void (*ble_connected_cb_t)(const char *address, uint16_t conn_handle);
 typedef void (*ble_disconnected_cb_t)(const char *address, int reason);
 typedef void (*ble_notification_cb_t)(
     const char *address,
+    const char *characteristic_uuid,
     const uint8_t *payload,
     size_t payload_len,
     uint64_t gateway_time_us
@@ -29,6 +30,8 @@ int ble_interface_stop_scan(void);
 
 int ble_interface_connect(const char *address);
 int ble_interface_disconnect(const char *address);
+int ble_interface_disconnect_all(void);
+int ble_interface_reset_state(void);
 
 int ble_interface_discover_gatt(const char *address);
 int ble_interface_subscribe(const char *address, const char *characteristic_uuid);
@@ -58,3 +61,5 @@ int ble_interface_request_connection_params(
     uint16_t latency,
     uint16_t supervision_timeout_units
 );
+
+void ble_scheduler_report_notification_rx_stats(const char *request_id);

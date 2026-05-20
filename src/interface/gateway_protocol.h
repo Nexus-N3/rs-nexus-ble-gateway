@@ -18,6 +18,7 @@ typedef enum {
     GW_CMD_GATT_WRITE,
     GW_CMD_GATT_READ,
     GW_CMD_GET_STATUS,
+    GW_CMD_RESET_SESSION,
 } gateway_command_type_t;
 
 typedef enum {
@@ -52,6 +53,7 @@ typedef struct {
     char request_id[GATEWAY_MAX_REQUEST_ID_LEN];
     uint32_t timeout_ms;
     bool without_response;
+    bool binary_notifications;
     char address[GATEWAY_MAX_ADDRESS_LEN];
     char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
     uint8_t payload[GATEWAY_MAX_FRAME_PAYLOAD];

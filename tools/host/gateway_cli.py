@@ -7,7 +7,7 @@ import serial
 
 
 DEFAULT_PORT = "/dev/serial/by-id/usb-SEGGER_J-Link_001057755524-if02"
-BAUD = 115200
+BAUD = 1000000
 
 
 def send_jsonl(ser, obj):

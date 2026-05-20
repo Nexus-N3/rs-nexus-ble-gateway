@@ -14,6 +14,7 @@ typedef struct {
 
 int gateway_interface_init(const gateway_interface_callbacks_t *callbacks);
 int gateway_interface_poll(void);
+int gateway_interface_reset_transport_state(void);
 
 int gateway_interface_send_event(const gateway_event_t *event);
 int gateway_interface_send_frame(const gateway_sensor_frame_t *frame);
@@ -25,6 +26,7 @@ int gateway_interface_send_log(const char *message);
 int gateway_interface_send_ready(void);
 int gateway_interface_send_hello_ack(const char *request_id);
 int gateway_interface_send_status(const char *request_id);
+int gateway_interface_send_transport_stats(void);
 
 int gateway_interface_send_error(
     const char *request_id,
@@ -42,6 +44,12 @@ int gateway_interface_send_not_implemented(
  * Production should move to structured event serialization or binary framing.
  */
 int gateway_interface_send_json_line(const char *json);
+int gateway_interface_send_stream_frame(
+    uint8_t sensor_id,
+    const uint8_t *payload,
+    uint16_t payload_len,
+    uint64_t gateway_timestamp_us
+);
 
 int gateway_interface_send_scan_result(
     const char *request_id,

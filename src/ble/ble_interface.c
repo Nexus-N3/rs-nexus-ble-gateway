@@ -12,7 +12,26 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef GATEWAY_ENABLE_GATT_DEBUG
+#define GATEWAY_ENABLE_GATT_DEBUG 0
+#endif
+
 #define BLE_MAX_DISCOVERED_PEERS 32
+
+// ble scheduling parameters
+
+// 12: 15ms, 24: 30ms, 40: 50ms
+#define BLE_CONN_MIN_INTERVAL_UNITS 12  
+#define BLE_CONN_MAX_INTERVAL_UNITS 24   
+#define BLE_CONN_LATENCY 0
+#define BLE_CONN_SUPERVISION_TIMEOUT_UNITS 400 /* 4 s */
+
+static const struct bt_le_conn_param g_ble_conn_param = {
+    .interval_min = BLE_CONN_MIN_INTERVAL_UNITS,
+    .interval_max = BLE_CONN_MAX_INTERVAL_UNITS,
+    .latency = BLE_CONN_LATENCY,
+    .timeout = BLE_CONN_SUPERVISION_TIMEOUT_UNITS,
+};
 
 static ble_interface_callbacks_t g_callbacks;
 static bool g_ble_ready;
@@ -23,6 +42,7 @@ typedef struct {
     struct bt_uuid_any uuid;
     struct k_sem done;
     uint16_t value_handle;
+    uint16_t ccc_handle;
     int err;
 } gatt_discover_ctx_t;
 
@@ -40,6 +60,13 @@ typedef struct {
     size_t bytes_copied;
     int err;
 } gatt_read_ctx_t;
+
+typedef struct {
+    bool used;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
+    struct bt_gatt_subscribe_params params;
+} gatt_subscribe_ctx_t;
 
 typedef struct {
     char name[32];
@@ -65,7 +92,9 @@ static known_peer_t g_known_peers[BLE_MAX_DISCOVERED_PEERS];
 static gatt_discover_ctx_t g_discover_ctx;
 static gatt_write_ctx_t g_write_ctx;
 static gatt_read_ctx_t g_read_ctx;
+static gatt_subscribe_ctx_t g_subscribe_ctxs[GATEWAY_MAX_SENSORS];
 
+#if GATEWAY_ENABLE_GATT_DEBUG
 static void emit_gatt_debug(
     const char *phase,
     const char *address,
@@ -103,6 +132,11 @@ static void emit_gatt_debug(
 
     gateway_interface_send_log(line);
 }
+#else
+
+#define emit_gatt_debug(...) do { } while (0)
+
+#endif
 
 static bool parse_advertising_data(
     struct bt_data *data,
@@ -128,6 +162,7 @@ static bool parse_advertising_data(
     return true;
 }
 
+
 static void format_address(
     const bt_addr_le_t *addr,
     char *out,
@@ -149,6 +184,91 @@ static void format_address(
         addr->a.val[1],
         addr->a.val[0]
     );
+}
+
+static void on_le_param_updated(
+    struct bt_conn *conn,
+    uint16_t interval,
+    uint16_t latency,
+    uint16_t timeout
+)
+{
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    char line[192];
+
+    format_address(bt_conn_get_dst(conn), address, sizeof(address));
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"conn_param_updated\","
+        "\"address\":\"%s\","
+        "\"interval_units\":%u,"
+        "\"interval_ms_x100\":%u,"
+        "\"latency\":%u,"
+        "\"timeout_units\":%u}",
+        address,
+        (unsigned int)interval,
+        (unsigned int)(interval * 125U),
+        (unsigned int)latency,
+        (unsigned int)timeout
+    );
+
+    //gateway_interface_send_log(line);
+    gateway_interface_send_json_line(line);
+}
+
+static gatt_subscribe_ctx_t *find_subscribe_ctx(
+    const char *address,
+    const char *characteristic_uuid
+)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(g_subscribe_ctxs); i++) {
+        if (g_subscribe_ctxs[i].used &&
+            strcmp(g_subscribe_ctxs[i].address, address) == 0 &&
+            strcmp(g_subscribe_ctxs[i].characteristic_uuid, characteristic_uuid) == 0) {
+            return &g_subscribe_ctxs[i];
+        }
+    }
+
+    return NULL;
+}
+
+static gatt_subscribe_ctx_t *allocate_subscribe_ctx(
+    const char *address,
+    const char *characteristic_uuid
+)
+{
+    gatt_subscribe_ctx_t *existing =
+        find_subscribe_ctx(address, characteristic_uuid);
+
+    if (existing != NULL) {
+        return existing;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_subscribe_ctxs); i++) {
+        if (!g_subscribe_ctxs[i].used) {
+            memset(&g_subscribe_ctxs[i], 0, sizeof(g_subscribe_ctxs[i]));
+
+            g_subscribe_ctxs[i].used = true;
+
+            strncpy(
+                g_subscribe_ctxs[i].address,
+                address,
+                sizeof(g_subscribe_ctxs[i].address) - 1
+            );
+
+            strncpy(
+                g_subscribe_ctxs[i].characteristic_uuid,
+                characteristic_uuid,
+                sizeof(g_subscribe_ctxs[i].characteristic_uuid) - 1
+            );
+
+            return &g_subscribe_ctxs[i];
+        }
+    }
+
+    return NULL;
 }
 
 static active_conn_t *find_active_conn_by_address(const char *address)
@@ -189,6 +309,26 @@ static void finalize_connected(struct bt_conn *conn)
         0,
         0,
         false
+    );
+
+    char line[192];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"conn_param_apply\","
+        "\"address\":\"%s\"}",
+        address
+    );
+
+    gateway_interface_send_json_line(line);
+
+    (void)ble_interface_request_connection_params(
+        address,
+        BLE_CONN_MIN_INTERVAL_UNITS,
+        BLE_CONN_MAX_INTERVAL_UNITS,
+        BLE_CONN_LATENCY,
+        BLE_CONN_SUPERVISION_TIMEOUT_UNITS
     );
 
     if (g_callbacks.on_connected != NULL) {
@@ -248,6 +388,20 @@ static active_conn_t *allocate_active_conn(const char *address)
     }
 
     return NULL;
+}
+
+static void release_subscribe_ctxs_for_address(const char *address)
+{
+    if (address == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_subscribe_ctxs); i++) {
+        if (g_subscribe_ctxs[i].used &&
+            strcmp(g_subscribe_ctxs[i].address, address) == 0) {
+            memset(&g_subscribe_ctxs[i], 0, sizeof(g_subscribe_ctxs[i]));
+        }
+    }
 }
 
 static void release_active_conn(active_conn_t *entry)
@@ -331,6 +485,31 @@ static uint8_t discover_characteristic_cb(
             k_sem_give(&ctx->done);
             return BT_GATT_ITER_STOP;
         }
+    }
+
+    return BT_GATT_ITER_CONTINUE;
+}
+
+static uint8_t discover_ccc_cb(
+    struct bt_conn *conn,
+    const struct bt_gatt_attr *attr,
+    struct bt_gatt_discover_params *params
+)
+{
+    gatt_discover_ctx_t *ctx =
+        CONTAINER_OF(params, gatt_discover_ctx_t, params);
+
+    ARG_UNUSED(conn);
+
+    if (attr == NULL) {
+        k_sem_give(&ctx->done);
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (bt_uuid_cmp(attr->uuid, BT_UUID_GATT_CCC) == 0) {
+        ctx->ccc_handle = attr->handle;
+        k_sem_give(&ctx->done);
+        return BT_GATT_ITER_STOP;
     }
 
     return BT_GATT_ITER_CONTINUE;
@@ -494,6 +673,100 @@ static int discover_characteristic_handle(
     return 0;
 }
 
+static int discover_ccc_handle(
+    struct bt_conn *conn,
+    const char *characteristic_uuid,
+    uint16_t value_handle,
+    uint16_t *ccc_handle_out
+)
+{
+    int rc;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+
+    if (conn == NULL || characteristic_uuid == NULL || value_handle == 0 || ccc_handle_out == NULL) {
+        return -1;
+    }
+
+    format_address(bt_conn_get_dst(conn), address, sizeof(address));
+
+    memset(&g_discover_ctx, 0, sizeof(g_discover_ctx));
+    k_sem_init(&g_discover_ctx.done, 0, 1);
+
+    g_discover_ctx.params.uuid = BT_UUID_GATT_CCC;
+    g_discover_ctx.params.func = discover_ccc_cb;
+    g_discover_ctx.params.start_handle = value_handle + 1U;
+    g_discover_ctx.params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+    g_discover_ctx.params.type = BT_GATT_DISCOVER_DESCRIPTOR;
+
+    emit_gatt_debug(
+        "discover_ccc_start",
+        address,
+        characteristic_uuid,
+        value_handle,
+        bt_gatt_get_mtu(conn),
+        0,
+        0,
+        false
+    );
+
+    rc = bt_gatt_discover(conn, &g_discover_ctx.params);
+    if (rc != 0) {
+        emit_gatt_debug(
+            "discover_ccc_submit_failed",
+            address,
+            characteristic_uuid,
+            value_handle,
+            bt_gatt_get_mtu(conn),
+            0,
+            rc,
+            false
+        );
+        return rc;
+    }
+
+    if (k_sem_take(&g_discover_ctx.done, K_SECONDS(5)) != 0) {
+        emit_gatt_debug(
+            "discover_ccc_timeout",
+            address,
+            characteristic_uuid,
+            value_handle,
+            bt_gatt_get_mtu(conn),
+            0,
+            -110,
+            false
+        );
+        return -110;
+    }
+
+    if (g_discover_ctx.ccc_handle == 0) {
+        emit_gatt_debug(
+            "discover_ccc_missing",
+            address,
+            characteristic_uuid,
+            value_handle,
+            bt_gatt_get_mtu(conn),
+            0,
+            -2,
+            false
+        );
+        return -2;
+    }
+
+    *ccc_handle_out = g_discover_ctx.ccc_handle;
+    emit_gatt_debug(
+        "discover_ccc_complete",
+        address,
+        characteristic_uuid,
+        *ccc_handle_out,
+        bt_gatt_get_mtu(conn),
+        0,
+        0,
+        false
+    );
+
+    return 0;
+}
+
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
     char address[GATEWAY_MAX_ADDRESS_LEN];
@@ -538,6 +811,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
     format_address(bt_conn_get_dst(conn), address, sizeof(address));
 
     if (entry != NULL) {
+        release_subscribe_ctxs_for_address(address);
         release_active_conn(entry);
     }
 
@@ -549,6 +823,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 static struct bt_conn_cb g_conn_callbacks = {
     .connected = on_connected,
     .disconnected = on_disconnected,
+    .le_param_updated = on_le_param_updated,
 };
 
 static void device_found(
@@ -611,6 +886,8 @@ int ble_interface_init(const ble_interface_callbacks_t *callbacks)
         return 0;
     }
 
+    memset(g_subscribe_ctxs, 0, sizeof(g_subscribe_ctxs));
+
     int rc = bt_enable(NULL);
     bt_conn_cb_register(&g_conn_callbacks);
     if (rc != 0) {
@@ -623,7 +900,6 @@ int ble_interface_init(const ble_interface_callbacks_t *callbacks)
 
 int ble_interface_start_scan(uint32_t timeout_ms)
 {
-    //(void)spec;
     ARG_UNUSED(timeout_ms);
 
     if (!g_ble_ready) {
@@ -637,9 +913,8 @@ int ble_interface_start_scan(uint32_t timeout_ms)
     memset(g_known_peers, 0, sizeof(g_known_peers));
 
     struct bt_le_scan_param scan_param = {
-        .type = BT_LE_SCAN_TYPE_ACTIVE, //BT_LE_SCAN_TYPE_PASSIVE,
+        .type = BT_LE_SCAN_TYPE_ACTIVE, 
         .options = BT_LE_SCAN_OPT_FILTER_DUPLICATE,
-        //.options = BT_LE_SCAN_OPT_NONE,
         .interval = BT_GAP_SCAN_FAST_INTERVAL,
         .window = BT_GAP_SCAN_FAST_WINDOW,
     };
@@ -700,7 +975,7 @@ int ble_interface_connect(const char *address)
     int rc = bt_conn_le_create(
         &peer->addr,
         BT_CONN_LE_CREATE_CONN,
-        BT_LE_CONN_PARAM_DEFAULT,
+        &g_ble_conn_param,
         &conn
     );
 
@@ -730,10 +1005,42 @@ int ble_interface_disconnect(const char *address)
     return bt_conn_disconnect(entry->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 }
 
+int ble_interface_disconnect_all(void)
+{
+    int first_rc = 0;
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_active_conns); i++) {
+        if (!g_active_conns[i].used || g_active_conns[i].conn == NULL) {
+            continue;
+        }
+
+        int rc = bt_conn_disconnect(
+            g_active_conns[i].conn,
+            BT_HCI_ERR_REMOTE_USER_TERM_CONN
+        );
+
+        if (rc != 0 && first_rc == 0) {
+            first_rc = rc;
+        }
+    }
+
+    return first_rc;
+}
+
+int ble_interface_reset_state(void)
+{
+    memset(g_known_peers, 0, sizeof(g_known_peers));
+    memset(g_subscribe_ctxs, 0, sizeof(g_subscribe_ctxs));
+    memset(&g_discover_ctx, 0, sizeof(g_discover_ctx));
+    memset(&g_write_ctx, 0, sizeof(g_write_ctx));
+    memset(&g_read_ctx, 0, sizeof(g_read_ctx));
+    g_scanning = false;
+    return 0;
+}
+
 int ble_interface_discover_gatt(const char *address)
 {
     (void)address;
-    //(void)spec;
 
     /*
      * TODO:
@@ -743,17 +1050,148 @@ int ble_interface_discover_gatt(const char *address)
     return -2;
 }
 
+static uint8_t notify_cb(
+    struct bt_conn *conn,
+    struct bt_gatt_subscribe_params *params,
+    const void *data,
+    uint16_t length
+)
+{
+    gatt_subscribe_ctx_t *ctx =
+        CONTAINER_OF(params, gatt_subscribe_ctx_t, params);
+
+    ARG_UNUSED(conn);
+
+    if (data == NULL) {
+        memset(ctx, 0, sizeof(*ctx));
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (g_callbacks.on_notification != NULL) {
+        g_callbacks.on_notification(
+            ctx->address,
+            ctx->characteristic_uuid,
+            data,
+            length,
+            k_ticks_to_us_floor64(k_uptime_ticks())
+        );
+    }
+
+    return BT_GATT_ITER_CONTINUE;
+}
+
 int ble_interface_subscribe(const char *address, const char *characteristic_uuid)
 {
-    (void)address;
-    (void)characteristic_uuid;
+    active_conn_t *entry;
+    gatt_subscribe_ctx_t *ctx;
+    uint16_t value_handle = 0;
+    uint16_t ccc_handle = 0;
+    int rc;
 
-    /*
-     * TODO:
-     * - enable notifications/indications
-     * - write CCCD
-     */
-    return -2;
+    if (address == NULL || characteristic_uuid == NULL) {
+        return -1;
+    }
+
+    entry = find_active_conn_by_address(address);
+    if (entry == NULL || entry->conn == NULL) {
+        return -3;
+    }
+
+    ctx = find_subscribe_ctx(address, characteristic_uuid);
+    if (ctx != NULL) {
+        emit_gatt_debug(
+            "subscribe_already_active",
+            address,
+            characteristic_uuid,
+            ctx->params.value_handle,
+            bt_gatt_get_mtu(entry->conn),
+            0,
+            0,
+            false
+        );
+
+        return 0;
+    }
+
+    ctx = allocate_subscribe_ctx(address, characteristic_uuid);
+    if (ctx == NULL) {
+        return -12;
+    }
+
+    rc = discover_characteristic_handle(
+        entry->conn,
+        characteristic_uuid,
+        &value_handle
+    );
+
+    if (rc != 0) {
+        emit_gatt_debug(
+            "subscribe_discover_failed",
+            address,
+            characteristic_uuid,
+            0,
+            bt_gatt_get_mtu(entry->conn),
+            0,
+            rc,
+            false
+        );
+        memset(ctx, 0, sizeof(*ctx));
+        return rc;
+    }
+
+    rc = discover_ccc_handle(
+        entry->conn,
+        characteristic_uuid,
+        value_handle,
+        &ccc_handle
+    );
+
+    if (rc != 0) {
+        memset(ctx, 0, sizeof(*ctx));
+        return rc;
+    }
+
+    memset(&ctx->params, 0, sizeof(ctx->params));
+
+    ctx->params.notify = notify_cb;
+    ctx->params.value = BT_GATT_CCC_NOTIFY;
+    ctx->params.value_handle = value_handle;
+    ctx->params.ccc_handle = ccc_handle;
+
+    emit_gatt_debug(
+        "subscribe_start",
+        address,
+        characteristic_uuid,
+        value_handle,
+        bt_gatt_get_mtu(entry->conn),
+        0,
+        0,
+        false
+    );
+
+    rc = bt_gatt_subscribe(entry->conn, &ctx->params);
+
+    if (rc == -EALREADY) {
+        rc = 0;
+    }
+
+    emit_gatt_debug(
+        "subscribe_complete",
+        address,
+        characteristic_uuid,
+        value_handle,
+        bt_gatt_get_mtu(entry->conn),
+        0,
+        rc,
+        false
+    );
+
+    if (rc != 0) {
+        memset(ctx, 0, sizeof(*ctx));
+        return rc;
+    }
+
+    return 0;
 }
 
 int ble_interface_read(
@@ -993,15 +1431,65 @@ int ble_interface_request_connection_params(
     uint16_t supervision_timeout_units
 )
 {
-    (void)address;
-    (void)min_interval_units;
-    (void)max_interval_units;
-    (void)latency;
-    (void)supervision_timeout_units;
+    active_conn_t *entry;
+    struct bt_le_conn_param params;
+    int rc;
 
-    /*
-     * TODO:
-     * - vendor-specific connection parameter update request.
-     */
-    return -2;
+    if (address == NULL || address[0] == '\0') {
+        return -1;
+    }
+
+    if (min_interval_units == 0 ||
+        max_interval_units == 0 ||
+        min_interval_units > max_interval_units ||
+        supervision_timeout_units == 0) {
+        return -22;
+    }
+
+    entry = find_active_conn_by_address(address);
+    if (entry == NULL || entry->conn == NULL) {
+        return -3;
+    }
+
+    params.interval_min = min_interval_units;
+    params.interval_max = max_interval_units;
+    params.latency = latency;
+    params.timeout = supervision_timeout_units;
+
+    rc = bt_conn_le_param_update(entry->conn, &params);
+
+    char line[224];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"conn_param_request\","
+        "\"address\":\"%s\","
+        "\"min_interval_units\":%u,"
+        "\"max_interval_units\":%u,"
+        "\"latency\":%u,"
+        "\"timeout_units\":%u,"
+        "\"rc\":%d}",
+        address,
+        (unsigned int)min_interval_units,
+        (unsigned int)max_interval_units,
+        (unsigned int)latency,
+        (unsigned int)supervision_timeout_units,
+        rc
+    );
+
+    gateway_interface_send_json_line(line);
+
+    emit_gatt_debug(
+        "conn_param_update",
+        address,
+        "",
+        0,
+        bt_gatt_get_mtu(entry->conn),
+        0,
+        rc,
+        false
+    );
+
+    return rc;
 }

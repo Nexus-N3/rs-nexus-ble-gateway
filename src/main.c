@@ -1,6 +1,6 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
-
+#include "hardware/led.h"
 #include "app/gateway.h"
 
 #define LED0_NODE DT_ALIAS(led0)
@@ -18,6 +18,7 @@ static void heartbeat_init(void)
 #endif
 }
 
+// This function is called periodically to toggle the heartbeat LED. It uses a simple time check to toggle the LED every 500ms.
 static void heartbeat_tick(void)
 {
     static int64_t last_blink_ms;
@@ -36,14 +37,22 @@ static void heartbeat_tick(void)
 #endif
 }
 
+// This is the main entry point of the application. It initializes the heartbeat and gateway app, 
+// then enters an infinite loop where it runs the gateway app and ticks the heartbeat.
 int main(void)
 {
+
     heartbeat_init();
 
     gateway_app_init();
 
+    int rc = leds_init();
+    if(rc){
+        return rc;
+    }
+
     while (1) {
-        gateway_app_run_once();
+        gateway_app_run_once(); // comes from src/app/gateway.c
         heartbeat_tick();
         k_sleep(K_MSEC(1));
     }
