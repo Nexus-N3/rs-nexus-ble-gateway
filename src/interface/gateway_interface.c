@@ -15,7 +15,7 @@
 #define TX_CHUNK_SIZE 256
 #define RX_LINE_MAX 256
 #define UART_RX_BUF_SIZE 256
-#define TX_CONTROL_RING_SIZE 2048
+#define TX_CONTROL_RING_SIZE 8192
 #define TX_STREAM_RING_SIZE 16384
 
 static const struct device *uart_dev =
@@ -44,6 +44,20 @@ static volatile size_t tx_stream_head;
 static volatile size_t tx_stream_tail;
 static volatile size_t tx_stream_count;
 static volatile uint32_t tx_stream_drop_count;
+static volatile uint32_t tx_control_enqueue_success_count;
+static volatile uint32_t tx_control_enqueue_drop_count;
+static volatile uint32_t tx_stream_enqueue_success_count;
+static volatile uint32_t tx_stream_enqueue_drop_count;
+static volatile uint32_t tx_control_bytes_enqueued;
+static volatile uint32_t tx_stream_bytes_enqueued;
+static volatile uint32_t tx_control_bytes_dequeued;
+static volatile uint32_t tx_stream_bytes_dequeued;
+static volatile uint32_t tx_control_tx_done_count;
+static volatile uint32_t tx_stream_tx_done_count;
+static volatile uint32_t tx_control_tx_aborted_count;
+static volatile uint32_t tx_stream_tx_aborted_count;
+static volatile uint32_t tx_control_tx_start_failures;
+static volatile uint32_t tx_stream_tx_start_failures;
 
 typedef enum {
     TX_QUEUE_CONTROL = 0,
@@ -52,6 +66,8 @@ typedef enum {
 
 static uint8_t tx_chunk_buf[TX_CHUNK_SIZE];
 static volatile bool tx_in_progress;
+static volatile tx_queue_kind_t tx_active_queue_kind;
+static volatile size_t tx_active_len;
 static void transport_try_start_tx(void);
 
 static void process_rx_bytes(const uint8_t *buf, size_t len)
@@ -117,6 +133,11 @@ static int tx_enqueue_bytes(
 
     if ((ring_size - *count) < len) {
         *drop_count += 1U;
+        if (queue_kind == TX_QUEUE_CONTROL) {
+            tx_control_enqueue_drop_count++;
+        } else {
+            tx_stream_enqueue_drop_count++;
+        }
         irq_unlock(key);
         return -12;
     }
@@ -127,6 +148,13 @@ static int tx_enqueue_bytes(
     }
 
     *count += len;
+    if (queue_kind == TX_QUEUE_CONTROL) {
+        tx_control_enqueue_success_count++;
+        tx_control_bytes_enqueued += (uint32_t)len;
+    } else {
+        tx_stream_enqueue_success_count++;
+        tx_stream_bytes_enqueued += (uint32_t)len;
+    }
     irq_unlock(key);
 
     transport_try_start_tx();
@@ -173,6 +201,7 @@ static int tx_dequeue_into_buf(
             tx_control_head = (tx_control_head + 1U) % TX_CONTROL_RING_SIZE;
             tx_control_count--;
         }
+        tx_control_bytes_dequeued += (uint32_t)len;
     } else {
         if (queue_kind_out != NULL) {
             *queue_kind_out = TX_QUEUE_STREAM;
@@ -182,6 +211,7 @@ static int tx_dequeue_into_buf(
             tx_stream_head = (tx_stream_head + 1U) % TX_STREAM_RING_SIZE;
             tx_stream_count--;
         }
+        tx_stream_bytes_dequeued += (uint32_t)len;
     }
 
     irq_unlock(key);
@@ -228,7 +258,8 @@ static void transport_try_start_tx(void)
     tx_in_progress = true;
     irq_unlock(key);
 
-    len = tx_dequeue_into_buf(tx_chunk_buf, sizeof(tx_chunk_buf), NULL);
+    tx_queue_kind_t queue_kind = TX_QUEUE_CONTROL;
+    len = tx_dequeue_into_buf(tx_chunk_buf, sizeof(tx_chunk_buf), &queue_kind);
     if (len <= 0) {
         key = irq_lock();
         tx_in_progress = false;
@@ -236,9 +267,20 @@ static void transport_try_start_tx(void)
         return;
     }
 
+    key = irq_lock();
+    tx_active_queue_kind = queue_kind;
+    tx_active_len = (size_t)len;
+    irq_unlock(key);
+
     int rc = uart_tx(uart_dev, tx_chunk_buf, len, SYS_FOREVER_US);
     if (rc != 0) {
         key = irq_lock();
+        if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
+            tx_control_tx_start_failures++;
+        } else {
+            tx_stream_tx_start_failures++;
+        }
+        tx_active_len = 0;
         tx_in_progress = false;
         irq_unlock(key);
     }
@@ -759,9 +801,28 @@ static void uart_cb(
     ARG_UNUSED(user_data);
 
     switch (evt->type) {
-    case UART_TX_DONE:
+    case UART_TX_DONE: {
+        unsigned int key = irq_lock();
+        if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
+            tx_control_tx_done_count++;
+        } else {
+            tx_stream_tx_done_count++;
+        }
+        tx_active_len = 0;
+        tx_in_progress = false;
+        irq_unlock(key);
+        transport_try_start_tx();
+        break;
+    }
+
     case UART_TX_ABORTED: {
         unsigned int key = irq_lock();
+        if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
+            tx_control_tx_aborted_count++;
+        } else {
+            tx_stream_tx_aborted_count++;
+        }
+        tx_active_len = 0;
         tx_in_progress = false;
         irq_unlock(key);
         transport_try_start_tx();
@@ -822,10 +883,26 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
     tx_stream_tail = 0;
     tx_stream_count = 0;
     tx_stream_drop_count = 0;
+    tx_control_enqueue_success_count = 0;
+    tx_control_enqueue_drop_count = 0;
+    tx_stream_enqueue_success_count = 0;
+    tx_stream_enqueue_drop_count = 0;
+    tx_control_bytes_enqueued = 0;
+    tx_stream_bytes_enqueued = 0;
+    tx_control_bytes_dequeued = 0;
+    tx_stream_bytes_dequeued = 0;
+    tx_control_tx_done_count = 0;
+    tx_stream_tx_done_count = 0;
+    tx_control_tx_aborted_count = 0;
+    tx_stream_tx_aborted_count = 0;
+    tx_control_tx_start_failures = 0;
+    tx_stream_tx_start_failures = 0;
 
     uart_rx_buf_a_in_use = false;
     uart_rx_buf_b_in_use = false;
     tx_in_progress = false;
+    tx_active_queue_kind = TX_QUEUE_CONTROL;
+    tx_active_len = 0;
 
     if (uart_callback_set(uart_dev, uart_cb, NULL) != 0) {
         return -1;
@@ -863,6 +940,22 @@ int gateway_interface_reset_transport_state(void)
     tx_stream_tail = 0;
     tx_stream_count = 0;
     tx_stream_drop_count = 0;
+    tx_control_enqueue_success_count = 0;
+    tx_control_enqueue_drop_count = 0;
+    tx_stream_enqueue_success_count = 0;
+    tx_stream_enqueue_drop_count = 0;
+    tx_control_bytes_enqueued = 0;
+    tx_stream_bytes_enqueued = 0;
+    tx_control_bytes_dequeued = 0;
+    tx_stream_bytes_dequeued = 0;
+    tx_control_tx_done_count = 0;
+    tx_stream_tx_done_count = 0;
+    tx_control_tx_aborted_count = 0;
+    tx_stream_tx_aborted_count = 0;
+    tx_control_tx_start_failures = 0;
+    tx_stream_tx_start_failures = 0;
+    tx_active_queue_kind = TX_QUEUE_CONTROL;
+    tx_active_len = 0;
     tx_in_progress = false;
     irq_unlock(key);
 
@@ -998,6 +1091,84 @@ int gateway_interface_send_status(const char *request_id)
             "}}"
         );
     }
+
+    return gateway_interface_send_json_line(line);
+}
+
+int gateway_interface_send_transport_stats(void)
+{
+    char line[768];
+    unsigned int key = irq_lock();
+    const size_t control_ring_count = tx_control_count;
+    const size_t stream_ring_count = tx_stream_count;
+    const uint32_t control_ring_drops = tx_control_drop_count;
+    const uint32_t stream_ring_drops = tx_stream_drop_count;
+    const uint32_t control_enqueue_success = tx_control_enqueue_success_count;
+    const uint32_t control_enqueue_drops = tx_control_enqueue_drop_count;
+    const uint32_t stream_enqueue_success = tx_stream_enqueue_success_count;
+    const uint32_t stream_enqueue_drops = tx_stream_enqueue_drop_count;
+    const uint32_t control_enqueued = tx_control_bytes_enqueued;
+    const uint32_t stream_enqueued = tx_stream_bytes_enqueued;
+    const uint32_t control_dequeued = tx_control_bytes_dequeued;
+    const uint32_t stream_dequeued = tx_stream_bytes_dequeued;
+    const uint32_t control_tx_done = tx_control_tx_done_count;
+    const uint32_t stream_tx_done = tx_stream_tx_done_count;
+    const uint32_t control_tx_aborted = tx_control_tx_aborted_count;
+    const uint32_t stream_tx_aborted = tx_stream_tx_aborted_count;
+    const uint32_t control_tx_failures = tx_control_tx_start_failures;
+    const uint32_t stream_tx_failures = tx_stream_tx_start_failures;
+    const bool in_progress = tx_in_progress;
+    const unsigned int active_queue_kind = (unsigned int)tx_active_queue_kind;
+    const unsigned int active_len = (unsigned int)tx_active_len;
+    irq_unlock(key);
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"gateway_transport_stats\","
+        "\"control_ring_bytes\":%u,"
+        "\"stream_ring_bytes\":%u,"
+        "\"control_ring_drops\":%u,"
+        "\"stream_ring_drops\":%u,"
+        "\"control_enqueue_success\":%u,"
+        "\"control_enqueue_drops\":%u,"
+        "\"stream_enqueue_success\":%u,"
+        "\"stream_enqueue_drops\":%u,"
+        "\"control_bytes_enqueued\":%u,"
+        "\"stream_bytes_enqueued\":%u,"
+        "\"control_bytes_dequeued\":%u,"
+        "\"stream_bytes_dequeued\":%u,"
+        "\"control_tx_done\":%u,"
+        "\"stream_tx_done\":%u,"
+        "\"control_tx_aborted\":%u,"
+        "\"stream_tx_aborted\":%u,"
+        "\"control_tx_start_failures\":%u,"
+        "\"stream_tx_start_failures\":%u,"
+        "\"tx_in_progress\":%s,"
+        "\"active_queue_kind\":%u,"
+        "\"active_len\":%u}",
+        (unsigned int)control_ring_count,
+        (unsigned int)stream_ring_count,
+        (unsigned int)control_ring_drops,
+        (unsigned int)stream_ring_drops,
+        (unsigned int)control_enqueue_success,
+        (unsigned int)control_enqueue_drops,
+        (unsigned int)stream_enqueue_success,
+        (unsigned int)stream_enqueue_drops,
+        (unsigned int)control_enqueued,
+        (unsigned int)stream_enqueued,
+        (unsigned int)control_dequeued,
+        (unsigned int)stream_dequeued,
+        (unsigned int)control_tx_done,
+        (unsigned int)stream_tx_done,
+        (unsigned int)control_tx_aborted,
+        (unsigned int)stream_tx_aborted,
+        (unsigned int)control_tx_failures,
+        (unsigned int)stream_tx_failures,
+        in_progress ? "true" : "false",
+        active_queue_kind,
+        active_len
+    );
 
     return gateway_interface_send_json_line(line);
 }

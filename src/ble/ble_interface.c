@@ -18,6 +18,21 @@
 
 #define BLE_MAX_DISCOVERED_PEERS 32
 
+// ble scheduling parameters
+
+// 12: 15ms, 24: 30ms, 40: 50ms
+#define BLE_CONN_MIN_INTERVAL_UNITS 12  
+#define BLE_CONN_MAX_INTERVAL_UNITS 24   
+#define BLE_CONN_LATENCY 0
+#define BLE_CONN_SUPERVISION_TIMEOUT_UNITS 400 /* 4 s */
+
+static const struct bt_le_conn_param g_ble_conn_param = {
+    .interval_min = BLE_CONN_MIN_INTERVAL_UNITS,
+    .interval_max = BLE_CONN_MAX_INTERVAL_UNITS,
+    .latency = BLE_CONN_LATENCY,
+    .timeout = BLE_CONN_SUPERVISION_TIMEOUT_UNITS,
+};
+
 static ble_interface_callbacks_t g_callbacks;
 static bool g_ble_ready;
 static bool g_scanning;
@@ -147,6 +162,7 @@ static bool parse_advertising_data(
     return true;
 }
 
+
 static void format_address(
     const bt_addr_le_t *addr,
     char *out,
@@ -168,6 +184,38 @@ static void format_address(
         addr->a.val[1],
         addr->a.val[0]
     );
+}
+
+static void on_le_param_updated(
+    struct bt_conn *conn,
+    uint16_t interval,
+    uint16_t latency,
+    uint16_t timeout
+)
+{
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    char line[192];
+
+    format_address(bt_conn_get_dst(conn), address, sizeof(address));
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"conn_param_updated\","
+        "\"address\":\"%s\","
+        "\"interval_units\":%u,"
+        "\"interval_ms_x100\":%u,"
+        "\"latency\":%u,"
+        "\"timeout_units\":%u}",
+        address,
+        (unsigned int)interval,
+        (unsigned int)(interval * 125U),
+        (unsigned int)latency,
+        (unsigned int)timeout
+    );
+
+    //gateway_interface_send_log(line);
+    gateway_interface_send_json_line(line);
 }
 
 static gatt_subscribe_ctx_t *find_subscribe_ctx(
@@ -261,6 +309,26 @@ static void finalize_connected(struct bt_conn *conn)
         0,
         0,
         false
+    );
+
+    char line[192];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"conn_param_apply\","
+        "\"address\":\"%s\"}",
+        address
+    );
+
+    gateway_interface_send_json_line(line);
+
+    (void)ble_interface_request_connection_params(
+        address,
+        BLE_CONN_MIN_INTERVAL_UNITS,
+        BLE_CONN_MAX_INTERVAL_UNITS,
+        BLE_CONN_LATENCY,
+        BLE_CONN_SUPERVISION_TIMEOUT_UNITS
     );
 
     if (g_callbacks.on_connected != NULL) {
@@ -755,6 +823,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 static struct bt_conn_cb g_conn_callbacks = {
     .connected = on_connected,
     .disconnected = on_disconnected,
+    .le_param_updated = on_le_param_updated,
 };
 
 static void device_found(
@@ -906,7 +975,7 @@ int ble_interface_connect(const char *address)
     int rc = bt_conn_le_create(
         &peer->addr,
         BT_CONN_LE_CREATE_CONN,
-        BT_LE_CONN_PARAM_DEFAULT,
+        &g_ble_conn_param,
         &conn
     );
 
@@ -1362,15 +1431,65 @@ int ble_interface_request_connection_params(
     uint16_t supervision_timeout_units
 )
 {
-    (void)address;
-    (void)min_interval_units;
-    (void)max_interval_units;
-    (void)latency;
-    (void)supervision_timeout_units;
+    active_conn_t *entry;
+    struct bt_le_conn_param params;
+    int rc;
 
-    /*
-     * TODO:
-     * - vendor-specific connection parameter update request.
-     */
-    return -2;
+    if (address == NULL || address[0] == '\0') {
+        return -1;
+    }
+
+    if (min_interval_units == 0 ||
+        max_interval_units == 0 ||
+        min_interval_units > max_interval_units ||
+        supervision_timeout_units == 0) {
+        return -22;
+    }
+
+    entry = find_active_conn_by_address(address);
+    if (entry == NULL || entry->conn == NULL) {
+        return -3;
+    }
+
+    params.interval_min = min_interval_units;
+    params.interval_max = max_interval_units;
+    params.latency = latency;
+    params.timeout = supervision_timeout_units;
+
+    rc = bt_conn_le_param_update(entry->conn, &params);
+
+    char line[224];
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"conn_param_request\","
+        "\"address\":\"%s\","
+        "\"min_interval_units\":%u,"
+        "\"max_interval_units\":%u,"
+        "\"latency\":%u,"
+        "\"timeout_units\":%u,"
+        "\"rc\":%d}",
+        address,
+        (unsigned int)min_interval_units,
+        (unsigned int)max_interval_units,
+        (unsigned int)latency,
+        (unsigned int)supervision_timeout_units,
+        rc
+    );
+
+    gateway_interface_send_json_line(line);
+
+    emit_gatt_debug(
+        "conn_param_update",
+        address,
+        "",
+        0,
+        bt_gatt_get_mtu(entry->conn),
+        0,
+        rc,
+        false
+    );
+
+    return rc;
 }

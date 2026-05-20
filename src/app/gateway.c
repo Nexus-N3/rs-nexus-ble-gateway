@@ -18,18 +18,6 @@ static const char *request_id_or_null(const gateway_command_t *command)
     return command->request_id;
 }
 
-// Helper function to send a "not implemented" error for a given command and command name.
-static void send_not_implemented(
-    const gateway_command_t *command,
-    const char *command_name
-)
-{
-    gateway_interface_send_not_implemented(
-        request_id_or_null(command),
-        command_name
-    );
-}
-
 // Main handler for incoming gateway commands. This function is called by the gateway interface
 static void on_gateway_command(const gateway_command_t *command)
 {
@@ -45,6 +33,8 @@ static void on_gateway_command(const gateway_command_t *command)
 
     case GW_CMD_GET_STATUS:
         gateway_interface_send_status(request_id_or_null(command));
+        gateway_interface_send_transport_stats();
+        ble_scheduler_report_notification_rx_stats(request_id_or_null(command));
         break;
 
     case GW_CMD_SCAN_START:

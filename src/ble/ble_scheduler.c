@@ -1,30 +1,5 @@
-/*
-
-This is the most important part to refine
-Right now it is synchronous-looking and simplified. The real version should be event-driven:
-
-connection queue
-  connect one sensor
-  wait for connected callback
-  discover GATT
-  subscribe
-  configure
-  move to next sensor
-
-stream supervisor
-  check per-sensor frame rate
-  detect weak links
-  report health
-  reconnect if needed
-
-buffering
-  notification callback writes into ring buffer
-  interface layer drains ring buffer to host
-
-*/
 #include "ble_scheduler.h"
 #include "ble_interface.h"
-//#include "../sensors/sensor_spec.h"
 #include "../interface/gateway_interface.h"
 #include "../config/gateway_config.h"
 #include <string.h>
@@ -48,6 +23,28 @@ static uint8_t g_sensor_count = 0;
 #define NOTIFICATION_QUEUE_DEPTH 128
 #define NOTIFICATION_FLUSH_BUDGET 8
 #define ACTIVE_SUBSCRIPTION_MAX 16
+
+typedef struct {
+    bool used;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    uint32_t notification_count;
+    uint32_t timestamp_gap_events;
+    uint32_t estimated_dropped_packets;
+    uint32_t timestamp_reset_events;
+    uint32_t timestamp_discontinuity_events;
+    uint32_t last_sensor_timestamp_us;
+    bool has_last_sensor_timestamp;
+    uint32_t notification_queue_accepted;
+    uint32_t notification_queue_dropped;
+    uint32_t notification_queue_flushed;
+    uint32_t stream_enqueue_success;
+    uint32_t stream_enqueue_dropped;
+    uint32_t json_forward_success;
+    uint32_t json_forward_dropped;
+} notification_rx_stats_t;
+
+static notification_rx_stats_t g_notification_rx_stats[GATEWAY_MAX_SENSORS];
+static uint64_t g_next_notification_rx_stats_report_us;
 
 typedef enum {
     GATT_OP_NONE = 0,
@@ -97,7 +94,117 @@ typedef struct {
 
 static active_subscription_t g_active_subscriptions[ACTIVE_SUBSCRIPTION_MAX];
 
-static ble_scheduler_policy_t g_policy = {
+#define MOVELLA_EXPECTED_DELTA_US 16667U
+#define MOVELLA_GAP_THRESHOLD_US 25000U
+#define MOVELLA_MAX_COUNTED_GAP_US 1000000U
+#define NOTIFICATION_RX_STATS_REPORT_INTERVAL_US 1000000ULL
+
+static notification_rx_stats_t *find_or_alloc_notification_rx_stats(
+    const char *address
+)
+{
+    notification_rx_stats_t *free_slot = NULL;
+
+    if (address == NULL || address[0] == '\0') {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_notification_rx_stats); i++) {
+        if (g_notification_rx_stats[i].used &&
+            strcmp(g_notification_rx_stats[i].address, address) == 0) {
+            return &g_notification_rx_stats[i];
+        }
+
+        if (!g_notification_rx_stats[i].used && free_slot == NULL) {
+            free_slot = &g_notification_rx_stats[i];
+        }
+    }
+
+    if (free_slot == NULL) {
+        return NULL;
+    }
+
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->used = true;
+    strncpy(free_slot->address, address, sizeof(free_slot->address) - 1);
+
+    return free_slot;
+}
+
+static void update_notification_rx_stats(
+    const char *address,
+    const uint8_t *payload,
+    size_t payload_len
+)
+{
+    notification_rx_stats_t *stats;
+    uint32_t timestamp_us;
+    uint32_t previous_timestamp_us;
+    uint32_t delta_us;
+    uint32_t missing_packets;
+
+    if (payload == NULL || payload_len < 4) {
+        return;
+    }
+
+    stats = find_or_alloc_notification_rx_stats(address);
+    if (stats == NULL) {
+        return;
+    }
+
+    timestamp_us =
+        ((uint32_t)payload[0]) |
+        ((uint32_t)payload[1] << 8) |
+        ((uint32_t)payload[2] << 16) |
+        ((uint32_t)payload[3] << 24);
+
+    stats->notification_count++;
+
+    if (!stats->has_last_sensor_timestamp) {
+        stats->last_sensor_timestamp_us = timestamp_us;
+        stats->has_last_sensor_timestamp = true;
+        return;
+    }
+
+    previous_timestamp_us = stats->last_sensor_timestamp_us;
+
+    if (timestamp_us < previous_timestamp_us) {
+        stats->timestamp_reset_events++;
+        stats->last_sensor_timestamp_us = timestamp_us;
+        return;
+    }
+
+    delta_us = timestamp_us - previous_timestamp_us;
+    stats->last_sensor_timestamp_us = timestamp_us;
+
+    if (delta_us <= MOVELLA_GAP_THRESHOLD_US) {
+        return;
+    }
+
+    if (delta_us > MOVELLA_MAX_COUNTED_GAP_US) {
+        stats->timestamp_discontinuity_events++;
+        return;
+    }
+
+    missing_packets =
+        (delta_us + (MOVELLA_EXPECTED_DELTA_US / 2U)) /
+        MOVELLA_EXPECTED_DELTA_US;
+
+    if (missing_packets > 0U) {
+        missing_packets -= 1U;
+    }
+
+    if (missing_packets == 0U) {
+        return;
+    }
+
+    stats->timestamp_gap_events++;
+    stats->estimated_dropped_packets += missing_packets;
+}
+
+
+
+__maybe_unused static ble_scheduler_policy_t g_policy = {
     .max_parallel_connects = 1,
     .connect_gap_ms = 500,
     .post_connect_settle_ms = 5000,
@@ -337,10 +444,13 @@ static int start_next_connect(void)
 
 int ble_scheduler_init(void)
 {
+    memset(g_notification_rx_stats, 0, sizeof(g_notification_rx_stats));
     memset(g_sensors, 0, sizeof(g_sensors));
     memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
     memset(g_notification_queue, 0, sizeof(g_notification_queue));
     memset(g_active_subscriptions, 0, sizeof(g_active_subscriptions));
+
+    g_next_notification_rx_stats_report_us = 0;
     g_sensor_count = 0;
     g_connect_queue_count = 0;
     g_connect_queue_index = 0;
@@ -664,11 +774,8 @@ int ble_scheduler_reset_session(void)
 
 int ble_scheduler_get_status(void)
 {
-    /*
-     * TODO:
-     * emit one health event per sensor.
-     */
     gateway_interface_send_json_line("{\"type\":\"status\"}");
+    ble_scheduler_report_notification_rx_stats(NULL);
     return 0;
 }
 
@@ -677,7 +784,9 @@ static void flush_notification_queue(uint8_t budget)
     uint8_t flushed = 0;
 
     while (g_notification_count > 0 && flushed < budget) {
+        notification_rx_stats_t *stats;
         pending_notification_t item;
+        int rc;
         unsigned int key = irq_lock();
 
         if (g_notification_count == 0) {
@@ -691,13 +800,26 @@ static void flush_notification_queue(uint8_t budget)
         g_notification_count--;
         irq_unlock(key);
 
+        stats = find_or_alloc_notification_rx_stats(item.address);
+        if (stats != NULL) {
+            stats->notification_queue_flushed++;
+        }
+
         if (item.binary_notifications) {
-            gateway_interface_send_stream_frame(
+            rc = gateway_interface_send_stream_frame(
                 item.sensor_id,
                 item.payload,
                 item.payload_len,
                 item.gateway_time_us
             );
+
+            if (stats != NULL) {
+                if (rc == 0) {
+                    stats->stream_enqueue_success++;
+                } else {
+                    stats->stream_enqueue_dropped++;
+                }
+            }
         } else {
             static const char hex_chars[] = "0123456789ABCDEF";
             char payload_hex[(GATEWAY_MAX_FRAME_PAYLOAD * 2) + 1];
@@ -724,7 +846,15 @@ static void flush_notification_queue(uint8_t budget)
                 (unsigned int)item.payload_len,
                 (unsigned long long)item.gateway_time_us
             );
-            gateway_interface_send_json_line(line);
+            rc = gateway_interface_send_json_line(line);
+
+            if (stats != NULL) {
+                if (rc == 0) {
+                    stats->json_forward_success++;
+                } else {
+                    stats->json_forward_dropped++;
+                }
+            }
         }
         flushed++;
     }
@@ -888,6 +1018,69 @@ void ble_scheduler_tick(void)
     flush_notification_queue(NOTIFICATION_FLUSH_BUDGET);
 }
 
+
+
+void ble_scheduler_report_notification_rx_stats(const char *request_id)
+{
+    char complete_line[192];
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_notification_rx_stats); i++) {
+        char line[512];
+
+        if (!g_notification_rx_stats[i].used) {
+            continue;
+        }
+
+        snprintf(
+            line,
+            sizeof(line),
+            "{\"type\":\"ble_notification_rx_stats\","
+            "\"request_id\":\"%s\","
+            "\"address\":\"%s\","
+            "\"notification_count\":%u,"
+            "\"timestamp_gap_events\":%u,"
+            "\"estimated_dropped_packets\":%u,"
+            "\"timestamp_reset_events\":%u,"
+            "\"timestamp_discontinuity_events\":%u,"
+            "\"last_sensor_timestamp_us\":%u,"
+            "\"notification_queue_accepted\":%u,"
+            "\"notification_queue_dropped\":%u,"
+            "\"notification_queue_flushed\":%u,"
+            "\"stream_enqueue_success\":%u,"
+            "\"stream_enqueue_dropped\":%u,"
+            "\"json_forward_success\":%u,"
+            "\"json_forward_dropped\":%u}",
+            request_id != NULL ? request_id : "",
+            g_notification_rx_stats[i].address,
+            (unsigned int)g_notification_rx_stats[i].notification_count,
+            (unsigned int)g_notification_rx_stats[i].timestamp_gap_events,
+            (unsigned int)g_notification_rx_stats[i].estimated_dropped_packets,
+            (unsigned int)g_notification_rx_stats[i].timestamp_reset_events,
+            (unsigned int)g_notification_rx_stats[i].timestamp_discontinuity_events,
+            (unsigned int)g_notification_rx_stats[i].last_sensor_timestamp_us,
+            (unsigned int)g_notification_rx_stats[i].notification_queue_accepted,
+            (unsigned int)g_notification_rx_stats[i].notification_queue_dropped,
+            (unsigned int)g_notification_rx_stats[i].notification_queue_flushed,
+            (unsigned int)g_notification_rx_stats[i].stream_enqueue_success,
+            (unsigned int)g_notification_rx_stats[i].stream_enqueue_dropped,
+            (unsigned int)g_notification_rx_stats[i].json_forward_success,
+            (unsigned int)g_notification_rx_stats[i].json_forward_dropped
+        );
+
+        gateway_interface_send_json_line(line);
+    }
+
+    snprintf(
+        complete_line,
+        sizeof(complete_line),
+        "{\"type\":\"ble_notification_rx_stats_complete\","
+        "\"request_id\":\"%s\"}",
+        request_id != NULL ? request_id : ""
+    );
+    gateway_interface_send_json_line(complete_line);
+}
+
+
 void ble_scheduler_on_sensor_found(const ble_discovered_sensor_t *found)
 {
     if (found == NULL) {
@@ -1020,12 +1213,18 @@ void ble_scheduler_on_notification(
         payload_len = GATEWAY_MAX_FRAME_PAYLOAD;
     }
 
+    update_notification_rx_stats(address, payload, payload_len);
+
     subscription = find_active_subscription(address, characteristic_uuid);
+    notification_rx_stats_t *stats = find_or_alloc_notification_rx_stats(address);
 
     key = irq_lock();
     if (g_notification_count >= NOTIFICATION_QUEUE_DEPTH) {
         g_notification_drop_count++;
         irq_unlock(key);
+        if (stats != NULL) {
+            stats->notification_queue_dropped++;
+        }
         return;
     }
 
@@ -1042,4 +1241,8 @@ void ble_scheduler_on_notification(
     g_notification_tail = (uint16_t)((g_notification_tail + 1U) % NOTIFICATION_QUEUE_DEPTH);
     g_notification_count++;
     irq_unlock(key);
+
+    if (stats != NULL) {
+        stats->notification_queue_accepted++;
+    }
 }

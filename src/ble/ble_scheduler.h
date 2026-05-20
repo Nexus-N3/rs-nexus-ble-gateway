@@ -85,3 +85,4 @@ void ble_scheduler_on_notification(
     size_t payload_len,
     uint64_t gateway_time_us
 );
+void ble_scheduler_report_notification_rx_stats(const char *request_id);

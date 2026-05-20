@@ -61,3 +61,5 @@ int ble_interface_request_connection_params(
     uint16_t latency,
     uint16_t supervision_timeout_units
 );
+
+void ble_scheduler_report_notification_rx_stats(const char *request_id);

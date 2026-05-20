@@ -19,6 +19,8 @@ import struct
 import time
 from dataclasses import dataclass, replace
 from typing import Any
+import csv
+from pathlib import Path
 
 from gateway_discover_connect import (
     DEFAULT_PORT,
@@ -89,6 +91,7 @@ class SensorStats:
     measurement_packets_received: int = 0
     gap_events: int = 0
     estimated_dropped_packets: int = 0
+    host_parsed_frames: int = 0
 
     @property
     def expected_delta_us(self) -> float:
@@ -270,6 +273,15 @@ class GatewayClient:
         self.cached_stream_frames: list[StreamFrame] = []
         self.disconnected_addresses: set[str] = set()
         self.notification_drop_count: int = 0
+        self.gateway_transport_stats: dict[str, Any] = {}
+        self.gateway_ble_rx_stats: dict[str, dict[str, Any]] = {}
+        self.stream_checksum_failures: int = 0
+        self.stream_resync_drop_bytes: int = 0
+        self.stream_resync_events: int = 0
+        self.stream_partial_json_waits: int = 0
+        self.stream_partial_frame_waits: int = 0
+        self._partial_block_kind: str | None = None
+        self._partial_block_len: int = -1
 
     def send(self, obj: dict[str, Any]):
         line = json.dumps(obj, separators=(",", ":")) + "\n"
@@ -340,6 +352,67 @@ class GatewayClient:
                 self.cached_json.append(msg)
 
         raise TimeoutError(f"Timed out waiting for {success_type} request_id={request_id}")
+    
+    def get_status(
+        self,
+        timeout_s: float = 10.0,
+        expected_addresses: list[str] | None = None,
+    ):
+        request_id = f"status_{int(time.time() * 1000)}"
+        saw_status = False
+        saw_transport_stats = False
+        saw_ble_stats_complete = False
+        self.gateway_transport_stats = {}
+        self.send({"type": "get_status", "request_id": request_id})
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                msg = self.read_json(timeout_s=max(0.1, deadline - time.time()))
+                print(f"STATUS READ JSON: {msg}")
+                msg_type = msg.get("type")
+                if msg_type == "status" and msg.get("request_id") == request_id:
+                    saw_status = True
+                elif msg_type == "gateway_transport_stats":
+                    saw_transport_stats = True
+                elif (
+                    msg_type == "ble_notification_rx_stats_complete"
+                    and msg.get("request_id") == request_id
+                ):
+                    saw_ble_stats_complete = True
+
+                if (
+                    saw_status
+                    and saw_transport_stats
+                    and saw_ble_stats_complete
+                ):
+                    return
+            except TimeoutError:
+                continue
+
+        raise TimeoutError(
+            "Timed out waiting for complete status snapshot: "
+            f"saw_status={saw_status} "
+            f"saw_transport_stats={saw_transport_stats} "
+            f"saw_ble_stats_complete={saw_ble_stats_complete}"
+        )
+
+    def _clear_partial_block(self):
+        self._partial_block_kind = None
+        self._partial_block_len = -1
+
+    def _record_partial_block(self, kind: str):
+        current_len = len(self.buf)
+        if self._partial_block_kind == kind and self._partial_block_len == current_len:
+            return
+
+        self._partial_block_kind = kind
+        self._partial_block_len = current_len
+
+        if kind == "json":
+            self.stream_partial_json_waits += 1
+        elif kind == "frame":
+            self.stream_partial_frame_waits += 1
 
     def hello(self):
         request_id = "hello_host_tool"
@@ -505,6 +578,30 @@ class GatewayClient:
             if address:
                 self.disconnected_addresses.add(address)
 
+        elif msg_type == "conn_param_apply":
+            print(f"CONN PARAM APPLY: {msg.get('address')}")
+        
+        elif msg_type == "conn_param_updated":
+            print(
+                "CONN PARAM UPDATED: "
+                f"{msg.get('address')} "
+                f"interval_units={msg.get('interval_units')} "
+                f"interval_ms_x100={msg.get('interval_ms_x100')} "
+                f"latency={msg.get('latency')} "
+                f"timeout_units={msg.get('timeout_units')}"
+            )
+
+        elif msg_type == "conn_param_request":
+            print(
+                "CONN PARAM REQUEST: "
+                f"{msg.get('address')} "
+                f"min={msg.get('min_interval_units')} "
+                f"max={msg.get('max_interval_units')} "
+                f"latency={msg.get('latency')} "
+                f"timeout={msg.get('timeout_units')} "
+                f"rc={msg.get('rc')}"
+            )
+
         elif msg_type == "notification_drops":
             value = msg.get("drop_count")
             if isinstance(value, int):
@@ -517,15 +614,56 @@ class GatewayClient:
                 f"seen_count={msg.get('seen_count')} "
                 f"drop_count={msg.get('drop_count')}"
             )
+        
+        elif msg_type == "ble_notification_rx_stats":
+            address = str(msg.get("address", ""))
+            if address:
+                self.gateway_ble_rx_stats[address] = msg
+            print(
+                "BLE RX STATS: "
+                f"{msg.get('address')} "
+                f"count={msg.get('notification_count')} "
+                f"gap_events={msg.get('timestamp_gap_events')} "
+                f"drops={msg.get('estimated_dropped_packets')} "
+                f"resets={msg.get('timestamp_reset_events')} "
+                f"discontinuities={msg.get('timestamp_discontinuity_events')} "
+                f"last_ts={msg.get('last_sensor_timestamp_us')} "
+                f"queue_accept={msg.get('notification_queue_accepted')} "
+                f"queue_drop={msg.get('notification_queue_dropped')} "
+                f"queue_flushed={msg.get('notification_queue_flushed')} "
+                f"stream_ok={msg.get('stream_enqueue_success')} "
+                f"stream_drop={msg.get('stream_enqueue_dropped')}"
+            )
+
+        elif msg_type == "ble_notification_rx_stats_complete":
+            print(
+                "BLE RX STATS COMPLETE: "
+                f"request_id={msg.get('request_id')}"
+            )
+
+        elif msg_type == "gateway_transport_stats":
+            self.gateway_transport_stats = msg
+            print(
+                "GATEWAY TRANSPORT STATS: "
+                f"stream_ring_bytes={msg.get('stream_ring_bytes')} "
+                f"stream_ring_drops={msg.get('stream_ring_drops')} "
+                f"stream_enqueue_success={msg.get('stream_enqueue_success')} "
+                f"stream_enqueue_drops={msg.get('stream_enqueue_drops')} "
+                f"stream_tx_done={msg.get('stream_tx_done')} "
+                f"stream_tx_aborted={msg.get('stream_tx_aborted')} "
+                f"stream_tx_start_failures={msg.get('stream_tx_start_failures')}"
+            )
 
     def _extract_item(self):
         while self.buf:
             if self.buf[0] == ord("{"):
                 newline_index = self.buf.find(b"\n")
                 if newline_index < 0:
+                    self._record_partial_block("json")
                     return None
                 line = self.buf[:newline_index].decode("utf-8", errors="replace").strip()
                 del self.buf[: newline_index + 1]
+                self._clear_partial_block()
                 if not line:
                     continue
                 for msg in json_objects_from_line(line):
@@ -534,20 +672,34 @@ class GatewayClient:
 
             if len(self.buf) >= 2 and self.buf[:2] == STREAM_FRAME_MAGIC:
                 if len(self.buf) < 14:
+                    self._record_partial_block("frame")
                     return None
                 version = self.buf[2]
+                if version != 0x01:
+                    self.stream_resync_drop_bytes += 1
+                    self.stream_resync_events += 1
+                    del self.buf[:1]
+                    self._clear_partial_block()
+                    continue
                 sensor_id = self.buf[3]
                 gateway_timestamp_us = int.from_bytes(self.buf[4:12], "little")
                 payload_len = self.buf[12]
                 total_len = 13 + payload_len + 1
                 if len(self.buf) < total_len:
+                    self._record_partial_block("frame")
                     return None
                 payload = bytes(self.buf[13 : 13 + payload_len])
                 checksum = self.buf[13 + payload_len]
                 computed = sum(self.buf[2 : 13 + payload_len]) & 0xFF
-                del self.buf[:total_len]
                 if checksum != computed:
+                    self.stream_checksum_failures += 1
+                    self.stream_resync_drop_bytes += 1
+                    self.stream_resync_events += 1
+                    del self.buf[:1]
+                    self._clear_partial_block()
                     continue
+                del self.buf[:total_len]
+                self._clear_partial_block()
                 return (
                     "stream_frame",
                     StreamFrame(
@@ -561,9 +713,22 @@ class GatewayClient:
             next_bin = self.buf.find(STREAM_FRAME_MAGIC)
             candidates = [idx for idx in (next_json, next_bin) if idx >= 0]
             if not candidates:
-                self.buf.clear()
+                keep_len = 1 if self.buf[-1:] == STREAM_FRAME_MAGIC[:1] else 0
+                drop_len = len(self.buf) - keep_len
+                if drop_len > 0:
+                    self.stream_resync_drop_bytes += drop_len
+                    self.stream_resync_events += 1
+                    del self.buf[:drop_len]
+                self._clear_partial_block()
                 return None
-            del self.buf[: min(candidates)]
+            drop_len = min(candidates)
+            if drop_len > 0:
+                self.stream_resync_drop_bytes += drop_len
+                self.stream_resync_events += 1
+                del self.buf[:drop_len]
+                self._clear_partial_block()
+            else:
+                self._clear_partial_block()
 
         return None
 
@@ -607,6 +772,7 @@ class StreamAttempt:
         self.attempt_number = attempt_number
         self.outcome = ""
         self.reason = ""
+        self.status_warning = ""
         self.connected: list[str] = []
         self.address_by_sensor_id: dict[int, str] = {}
         self.stats: dict[str, SensorStats] = {}
@@ -615,53 +781,166 @@ class StreamAttempt:
         self.stream_frames_seen = 0
         self.stream_frames_unknown_sensor_id = 0
         self.unknown_sensor_ids = {}
+        self.post_stop_drain_frames = 0
+        self.stop_completed = False
+        self.disconnect_completed = False
+        self.frame_csv_file = None
+        self.frame_csv_writer = None
+
+    def _open_frame_csv(self):
+        if not self.args.frame_csv:
+            return
+
+        path = Path(self.args.frame_csv)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.frame_csv_file = path.open("a", newline="")
+        self.frame_csv_writer = csv.DictWriter(
+            self.frame_csv_file,
+            fieldnames=[
+                "attempt",
+                "host_time_monotonic",
+                "measurement_active",
+                "sensor_id",
+                "address",
+                "location",
+                "gateway_timestamp_us",
+                "sensor_timestamp_us",
+                "payload_len",
+                "sensor_delta_us",
+                "expected_delta_us",
+                "missing_packets",
+                "is_gap",
+            ],
+        )
+
+        if path.stat().st_size == 0:
+            self.frame_csv_writer.writeheader()
+
+
+    def _close_frame_csv(self):
+        if self.frame_csv_file is not None:
+            self.frame_csv_file.close()
+            self.frame_csv_file = None
+            self.frame_csv_writer = None
+
+    def _write_frame_csv_row(
+        self,
+        frame: StreamFrame,
+        address: str,
+        timestamp: int,
+        host_time: float,
+    ):
+        if self.frame_csv_writer is None:
+            return
+
+        stats = self.stats[address]
+        previous_timestamp = (
+            stats.measurement_last_sensor_timestamp
+            if self.measurement_active
+            else stats.startup_last_sensor_timestamp
+        )
+
+        sensor_delta_us = None
+        missing_packets = 0
+        is_gap = False
+
+        if previous_timestamp is not None:
+            sensor_delta_us = timestamp - previous_timestamp
+            if sensor_delta_us > int(stats.expected_delta_us * 1.5):
+                missing_packets = max(
+                    int(round(sensor_delta_us / stats.expected_delta_us)) - 1,
+                    0,
+                )
+                is_gap = missing_packets > 0
+
+        self.frame_csv_writer.writerow(
+            {
+                "attempt": self.attempt_number,
+                "host_time_monotonic": f"{host_time:.6f}",
+                "measurement_active": int(self.measurement_active),
+                "sensor_id": frame.sensor_id,
+                "address": address,
+                "location": stats.location or "",
+                "gateway_timestamp_us": frame.gateway_timestamp_us,
+                "sensor_timestamp_us": timestamp,
+                "payload_len": len(frame.payload),
+                "sensor_delta_us": "" if sensor_delta_us is None else sensor_delta_us,
+                "expected_delta_us": f"{stats.expected_delta_us:.3f}",
+                "missing_packets": missing_packets,
+                "is_gap": int(is_gap),
+            }
+        )
 
     def run(self):
-        self.client.reset_session(timeout_s=5.0)
-        self.client.hello()
-        print(f"Scanning for up to {self.args.scan_timeout_ms}ms...")
-        matches = self.client.discover_movella(self.args.scan_timeout_ms)
-        selected = select_discovered_addresses(matches, self.sensor_count)
-        print(f"Selected addresses: {selected}")
-
-        locations = {
-            address: DEFAULT_LOCATIONS[index] if index < len(DEFAULT_LOCATIONS) else None
-            for index, address in enumerate(selected)
-        }
-
-        self.connected, sensor_id_by_address = self.client.connect(
-            selected,
-            timeout_s=self.args.connect_attempt_timeout_s,
-        )
-        self.address_by_sensor_id = {sensor_id: address for address, sensor_id in sensor_id_by_address.items()}
-        print(f"SENSOR ID MAP: {self.address_by_sensor_id}")
-        for address in self.connected:
-            self.stats[address] = SensorStats(
-                address=address,
-                location=locations.get(address),
-                expected_rate_hz=self.args.sampling_rate_hz,
-            )
-
+        self._open_frame_csv()
         try:
-            self.configure()
+            self.client.reset_session(timeout_s=5.0)
+            self.client.hello()
+            print(f"Scanning for up to {self.args.scan_timeout_ms}ms...")
+            matches = self.client.discover_movella(self.args.scan_timeout_ms)
+            selected = select_discovered_addresses(matches, self.sensor_count)
+            print(f"Selected addresses: {selected}")
+
+            locations = {
+                address: DEFAULT_LOCATIONS[index] if index < len(DEFAULT_LOCATIONS) else None
+                for index, address in enumerate(selected)
+            }
+
+            self.connected, sensor_id_by_address = self.client.connect(
+                selected,
+                timeout_s=self.args.connect_attempt_timeout_s,
+            )
+            self.address_by_sensor_id = {sensor_id: address for address, sensor_id in sensor_id_by_address.items()}
+            print(f"SENSOR ID MAP: {self.address_by_sensor_id}")
+            for address in self.connected:
+                self.stats[address] = SensorStats(
+                    address=address,
+                    location=locations.get(address),
+                    expected_rate_hz=self.args.sampling_rate_hz,
+                )
+
+            # wait for connetion stability before configuring
             if self.args.post_connect_settle_seconds > 0:
                 print(
-                    "All sensors configured. "
-                    f"Waiting {self.args.post_connect_settle_seconds:.1f}s before stream start."
+                    "All sensors connected. "
+                    f"Waiting {self.args.post_connect_settle_seconds:.1f}s for BLE links/params to settle."
                 )
-                time.sleep(self.args.post_connect_settle_seconds)
-            self.start_streams()
-            self.monitor()
-            self.stop_streams()
-            self.client.disconnect(self.connected, timeout_s=self.args.disconnect_timeout_s)
-            if not self.outcome:
-                self.outcome = "success"
-        except Exception as exc:
-            if not self.outcome:
+                time.sleep(self.args.post_connect_settle_seconds)    
+            try:
+                self.configure()
+                if self.args.post_connect_settle_seconds > 0:
+                    print(
+                        "All sensors configured. "
+                        f"Waiting {self.args.post_connect_settle_seconds:.1f}s before stream start."
+                    )
+                    time.sleep(self.args.post_connect_settle_seconds)
+                self.start_streams()
+                self.monitor()
+                self.stop_streams()
+                self.drain_after_stop()
+                try:
+                    self.client.get_status(
+                        timeout_s=10.0,
+                        expected_addresses=self.connected,
+                    )
+                except TimeoutError as exc:
+                    self.status_warning = str(exc)
+                    print(f"STATUS WARNING: {exc}")
+                self.client.disconnect(
+                    self.connected,
+                    timeout_s=self.args.disconnect_timeout_s,
+                )
+                self.disconnect_completed = True
+                if not self.outcome:
+                    self.outcome = "success"
+            except Exception as exc:
                 self.outcome = "retry"
                 self.reason = str(exc)
-            print(f"FAILED: {exc}")
-            self.cleanup()
+                print(f"FAILED: {exc}")
+                self.cleanup()
+        finally:
+            self._close_frame_csv()
 
     def configure(self):
         for address in self.connected:
@@ -730,6 +1009,9 @@ class StreamAttempt:
             print("Startup gate disabled. Official measurement is active immediately.")
 
     def stop_streams(self):
+        if self.stop_completed:
+            return
+
         print("Stopping stream now.")
 
         for address in self.connected:
@@ -746,22 +1028,60 @@ class StreamAttempt:
             except Exception as exc:
                 print(f"STOP STREAM FAILED: {address}: {exc}")
 
+        self.stop_completed = True
+
+    def drain_after_stop(
+        self,
+        quiet_window_s: float = 0.35,
+        max_drain_s: float = 2.0,
+    ):
+        print(
+            "Draining post-stop stream tail: "
+            f"quiet_window={quiet_window_s:.2f}s max_drain={max_drain_s:.2f}s."
+        )
+
+        drain_deadline = time.monotonic() + max_drain_s
+        quiet_deadline = time.monotonic() + quiet_window_s
+
+        while time.monotonic() < drain_deadline:
+            remaining_quiet = quiet_deadline - time.monotonic()
+            if remaining_quiet <= 0:
+                return
+
+            try:
+                item_type, item = self.client.read_item(
+                    timeout_s=max(0.01, min(0.1, remaining_quiet))
+                )
+            except TimeoutError:
+                continue
+
+            if item_type == "stream_frame":
+                self.post_stop_drain_frames += 1
+                quiet_deadline = time.monotonic() + quiet_window_s
+
+            self._handle_item(item_type, item)
+
+        print("Post-stop drain reached max_drain timeout.")
+
     def cleanup(self):
-        print("Cleanup: stop stream, then disconnect.")
+        print("Cleanup: stop stream if needed, then disconnect if needed.")
 
-        try:
-            self.stop_streams()
-        except Exception as exc:
-            print(f"Cleanup stop incomplete: {exc}")
+        if not self.stop_completed:
+            try:
+                self.stop_streams()
+            except Exception as exc:
+                print(f"Cleanup stop incomplete: {exc}")
 
-        try:
-            self.client.disconnect(self.connected, timeout_s=self.args.disconnect_timeout_s)
-        except Exception as exc:
-            print(f"Cleanup disconnect incomplete: {exc}")
-            if self.reason:
-                self.reason = f"{self.reason}; cleanup_disconnect_incomplete={exc}"
-            else:
-                self.reason = f"cleanup_disconnect_incomplete={exc}"
+        if not self.disconnect_completed:
+            try:
+                self.client.disconnect(self.connected, timeout_s=self.args.disconnect_timeout_s)
+                self.disconnect_completed = True
+            except Exception as exc:
+                print(f"Cleanup disconnect incomplete: {exc}")
+                if self.reason:
+                    self.reason = f"{self.reason}; cleanup_disconnect_incomplete={exc}"
+                else:
+                    self.reason = f"cleanup_disconnect_incomplete={exc}"
 
     def monitor(self):
         if self.stream_started_at is None:
@@ -830,12 +1150,22 @@ class StreamAttempt:
                 return
 
             timestamp = parse_movella_timestamp(frame.payload)
+            host_time = time.monotonic()
+
+            self._write_frame_csv_row(
+                frame=frame,
+                address=address,
+                timestamp=timestamp,
+                host_time=host_time,
+            )
+
             self.stats[address].record_sample(
                 timestamp,
-                time.monotonic(),
+                host_time,
                 self.measurement_active,
                 self.args.startup_gap_grace_seconds,
             )
+            self.stats[address].host_parsed_frames += 1
 
             if self.args.use_startup_gate and not self.measurement_active:
                 stable, _unstable = self.evaluate_startup_stability()
@@ -917,13 +1247,37 @@ class StreamAttempt:
         print("")
         print(f"Attempt {self.attempt_number} summary outcome={self.outcome or 'unknown'}")
         print(f"Reason: {self.reason or 'n/a'}")
+        if self.status_warning:
+            print(f"Status warning: {self.status_warning}")
         print(
             f"Stream frames seen={self.stream_frames_seen} "
             f"unknown_sensor_id_frames={self.stream_frames_unknown_sensor_id} "
             f"unknown_sensor_ids={self.unknown_sensor_ids}"
         )
+        print(f"Post-stop drain frames={self.post_stop_drain_frames}")
+        print(
+            "Host parser summary "
+            f"checksum_failures={self.client.stream_checksum_failures} "
+            f"resync_events={self.client.stream_resync_events} "
+            f"resync_drop_bytes={self.client.stream_resync_drop_bytes} "
+            f"partial_json_waits={self.client.stream_partial_json_waits} "
+            f"partial_frame_waits={self.client.stream_partial_frame_waits}"
+        )
+        if self.client.gateway_transport_stats:
+            transport = self.client.gateway_transport_stats
+            print(
+                "Gateway transport summary "
+                f"stream_ring_bytes={transport.get('stream_ring_bytes')} "
+                f"stream_ring_drops={transport.get('stream_ring_drops')} "
+                f"stream_enqueue_success={transport.get('stream_enqueue_success')} "
+                f"stream_enqueue_drops={transport.get('stream_enqueue_drops')} "
+                f"stream_tx_done={transport.get('stream_tx_done')} "
+                f"stream_tx_aborted={transport.get('stream_tx_aborted')} "
+                f"stream_tx_start_failures={transport.get('stream_tx_start_failures')}"
+            )
         for address in sorted(self.stats):
             stats = self.stats[address]
+            gateway_stats = self.client.gateway_ble_rx_stats.get(address, {})
             ttff = "n/a" if stats.time_to_first_packet_ms is None else f"{stats.time_to_first_packet_ms:.1f}"
             print(
                 f"{address} location={stats.location} "
@@ -937,10 +1291,18 @@ class StreamAttempt:
                 f"startup_gate_drops={stats.startup_gate_estimated_dropped_packets} "
                 f"time_to_first_packet_ms={ttff} "
                 f"packets={stats.measurement_packets_received} "
+                f"host_parsed_frames={stats.host_parsed_frames} "
                 f"observed_rate_hz={stats.observed_rate_hz:.2f} "
                 f"expected_rate_hz={stats.expected_rate_hz} "
                 f"gap_events={stats.gap_events} "
-                f"estimated_dropped_packets={stats.estimated_dropped_packets}"
+                f"estimated_dropped_packets={stats.estimated_dropped_packets} "
+                f"gateway_timestamp_resets={gateway_stats.get('timestamp_reset_events')} "
+                f"gateway_timestamp_discontinuities={gateway_stats.get('timestamp_discontinuity_events')} "
+                f"gateway_queue_accepted={gateway_stats.get('notification_queue_accepted')} "
+                f"gateway_queue_dropped={gateway_stats.get('notification_queue_dropped')} "
+                f"gateway_queue_flushed={gateway_stats.get('notification_queue_flushed')} "
+                f"gateway_stream_enqueue_success={gateway_stats.get('stream_enqueue_success')} "
+                f"gateway_stream_enqueue_dropped={gateway_stats.get('stream_enqueue_dropped')}"
             )
 
 
@@ -1013,6 +1375,7 @@ def build_parser():
     parser.add_argument("--retry-delay-seconds", type=float, default=5.0)
     parser.add_argument("--max-start-attempts", type=int, default=2)
     parser.add_argument("--without-response", action="store_true")
+    parser.add_argument("--frame-csv", default=None)
     return parser
 
 

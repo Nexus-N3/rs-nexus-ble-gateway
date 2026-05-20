@@ -26,6 +26,7 @@ int gateway_interface_send_log(const char *message);
 int gateway_interface_send_ready(void);
 int gateway_interface_send_hello_ack(const char *request_id);
 int gateway_interface_send_status(const char *request_id);
+int gateway_interface_send_transport_stats(void);
 
 int gateway_interface_send_error(
     const char *request_id,
