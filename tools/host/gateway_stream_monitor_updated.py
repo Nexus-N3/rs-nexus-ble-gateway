@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 import csv
 from pathlib import Path
+from collections import Counter
 
 from gateway_discover_connect import (
     DEFAULT_PORT,
@@ -41,6 +42,8 @@ DEFAULT_LOCATIONS = [
     "LOWER_BACK",
     "HEAD",
     "UPPER_BACK",
+    "LEFT_WRIST",
+    "RIGHT_WRIST",
 ]
 
 MOVELLA_NAME = "Movella DOT"
@@ -282,11 +285,16 @@ class GatewayClient:
         self.stream_partial_frame_waits: int = 0
         self._partial_block_kind: str | None = None
         self._partial_block_len: int = -1
+        self.phase = "idle"
 
     def send(self, obj: dict[str, Any]):
         line = json.dumps(obj, separators=(",", ":")) + "\n"
         self.ser.write(line.encode("utf-8"))
         self.ser.flush()
+
+    @staticmethod
+    def _normalize_address(address: str | None) -> str:
+        return "" if not address else address.strip().upper()
 
     def read_item(self, timeout_s: float = 10.0):
         if self.cached_stream_frames:
@@ -333,6 +341,54 @@ class GatewayClient:
 
         raise TimeoutError("Timed out waiting for JSON")
 
+    def _extract_json_only_item(self):
+        while self.buf:
+            if self.buf[0] != ord("{"):
+                next_json = self.buf.find(b"{")
+                if next_json < 0:
+                    self.stream_resync_drop_bytes += len(self.buf)
+                    self.stream_resync_events += 1
+                    self.buf.clear()
+                    return None
+                if next_json > 0:
+                    self.stream_resync_drop_bytes += next_json
+                    self.stream_resync_events += 1
+                    del self.buf[:next_json]
+                    continue
+
+            newline_index = self.buf.find(b"\n")
+            if newline_index < 0:
+                self._record_partial_block("json")
+                return None
+
+            line = self.buf[:newline_index].decode("utf-8", errors="replace").strip()
+            del self.buf[: newline_index + 1]
+            self._clear_partial_block()
+            if not line:
+                continue
+            for msg in json_objects_from_line(line):
+                return msg
+
+        return None
+
+    def read_json_only(self, timeout_s: float = 10.0) -> dict[str, Any]:
+        deadline = time.time() + timeout_s
+
+        while time.time() < deadline:
+            if self.cached_json:
+                return self.cached_json.pop(0)
+
+            msg = self._extract_json_only_item()
+            if msg is not None:
+                self._observe_json(msg)
+                return msg
+
+            chunk = self.ser.read(256)
+            if chunk:
+                self.buf.extend(chunk)
+
+        raise TimeoutError("Timed out waiting for JSON")
+
     def wait_for_request(self, request_id: str, success_type: str, timeout_s: float):
         deadline = time.time() + timeout_s
         while time.time() < deadline:
@@ -347,7 +403,7 @@ class GatewayClient:
                     f"Gateway command failed: {msg.get('message')} ({msg.get('error_code')})"
                 )
 
-            # Preserve unrelated JSON for higher-level waits only if it is not a noisy status/debug event.
+            # Preserve unrelated JSON for higher-level waits.
             if msg_type not in {"gatt_debug"}:
                 self.cached_json.append(msg)
 
@@ -464,7 +520,10 @@ class GatewayClient:
 
         deadline = time.time() + timeout_s
         while time.time() < deadline and pending:
-            msg = self.read_json(timeout_s=max(0.1, deadline - time.time()))
+            try:
+                msg = self.read_json(timeout_s=max(0.1, deadline - time.time()))
+            except TimeoutError:
+                raise
             msg_type = msg.get("type")
 
             if msg_type == "sensor_connected":
@@ -508,7 +567,15 @@ class GatewayClient:
         self.wait_for_request(request_id, "subscribe_complete", timeout_s)
         print(f"SUBSCRIBE COMPLETE: {address} uuid={uuid}")
 
-    def write(self, address: str, uuid: str, payload_hex: str, timeout_s: float, without_response: bool):
+    def write(
+        self,
+        address: str,
+        uuid: str,
+        payload_hex: str,
+        timeout_s: float,
+        without_response: bool,
+        allow_timeout: bool = False,
+    ):
         request_id = f"write_{int(time.time() * 1000)}"
         self.send(
             {
@@ -524,6 +591,10 @@ class GatewayClient:
         try:
             self.wait_for_request(request_id, "write_complete", timeout_s)
             return time.monotonic()
+        except TimeoutError:
+            if allow_timeout:
+                return None
+            raise
         except Exception as exc:
             raise RuntimeError(
                 f"gatt_write failed address={address} "
@@ -531,7 +602,12 @@ class GatewayClient:
                 f"without_response={without_response}: {exc}"
             ) from exc
 
-    def disconnect(self, addresses: list[str], timeout_s: float) -> list[str]:
+    def disconnect(
+        self,
+        addresses: list[str],
+        timeout_s: float,
+        allow_timeout: bool = False,
+    ) -> list[str]:
         request_id = f"disconnect_{int(time.time() * 1000)}"
         pending = [address for address in addresses if address not in self.disconnected_addresses]
         disconnected = [address for address in addresses if address in self.disconnected_addresses]
@@ -543,7 +619,13 @@ class GatewayClient:
         deadline = time.time() + timeout_s
 
         while time.time() < deadline and pending:
-            msg = self.read_json(timeout_s=max(0.1, deadline - time.time()))
+            try:
+                msg = self.read_json(timeout_s=max(0.1, deadline - time.time()))
+            except TimeoutError:
+                if allow_timeout:
+                    print("DISCONNECT WARNING: timed out waiting for gateway response")
+                    return disconnected
+                raise
             msg_type = msg.get("type")
 
             if msg_type == "sensor_disconnected":
@@ -565,7 +647,10 @@ class GatewayClient:
                 )
 
         if pending:
-            print("DISCONNECT INCOMPLETE:", pending)
+            if allow_timeout:
+                print("DISCONNECT WARNING: incomplete disconnect:", pending)
+            else:
+                print("DISCONNECT INCOMPLETE:", pending)
 
         return disconnected
 
@@ -576,6 +661,23 @@ class GatewayClient:
             address = msg.get("address")
             if address:
                 self.disconnected_addresses.add(address)
+            print(
+                "SENSOR DISCONNECTED: "
+                f"{msg.get('address')} "
+                f"phase={self.phase} "
+                f"request_id={msg.get('request_id')} "
+                f"active_connection_count={msg.get('active_connection_count')} "
+                f"reason={msg.get('reason')}"
+            )
+
+        elif msg_type == "sensor_connected":
+            print(
+                "SENSOR CONNECTED: "
+                f"{msg.get('address')} "
+                f"phase={self.phase} "
+                f"sensor_id={msg.get('sensor_id')} "
+                f"request_id={msg.get('request_id')}"
+            )
 
         elif msg_type == "conn_param_apply":
             print(f"CONN PARAM APPLY: {msg.get('address')}")
@@ -615,8 +717,10 @@ class GatewayClient:
             )
         
         elif msg_type == "ble_notification_rx_stats":
-            address = str(msg.get("address", ""))
+            address = self._normalize_address(str(msg.get("address", "")))
             if address:
+                msg = dict(msg)
+                msg["address"] = address
                 self.gateway_ble_rx_stats[address] = msg
             print(
                 "BLE RX STATS: "
@@ -627,6 +731,8 @@ class GatewayClient:
                 f"resets={msg.get('timestamp_reset_events')} "
                 f"discontinuities={msg.get('timestamp_discontinuity_events')} "
                 f"last_ts={msg.get('last_sensor_timestamp_us')} "
+                f"lookup_misses={msg.get('subscription_lookup_misses')} "
+                f"json_fallbacks={msg.get('json_fallback_notifications')} "
                 f"queue_accept={msg.get('notification_queue_accepted')} "
                 f"queue_drop={msg.get('notification_queue_dropped')} "
                 f"queue_flushed={msg.get('notification_queue_flushed')} "
@@ -637,7 +743,25 @@ class GatewayClient:
         elif msg_type == "ble_notification_rx_stats_complete":
             print(
                 "BLE RX STATS COMPLETE: "
-                f"request_id={msg.get('request_id')}"
+                f"request_id={msg.get('request_id')} "
+                f"summary_enqueued={msg.get('summary_enqueued')}"
+            )
+
+        elif msg_type == "ble_notification_rx_stats_summary":
+            print(
+                "BLE RX STATS SUMMARY: "
+                f"request_id={msg.get('request_id')} "
+                f"attempted={msg.get('attempted')} "
+                f"sent={msg.get('sent')} "
+                f"dropped={msg.get('dropped')}"
+            )
+
+        elif msg_type == "subscription_lookup_miss":
+            print(
+                "SUBSCRIPTION LOOKUP MISS: "
+                f"{msg.get('address')} "
+                f"uuid={msg.get('characteristic_uuid')} "
+                f"overflow_count={msg.get('subscription_table_overflow_count')}"
             )
 
         elif msg_type == "gateway_transport_stats":
@@ -753,7 +877,7 @@ def parse_sensor_counts(raw: str) -> list[int]:
     deduped: list[int] = []
     seen: set[int] = set()
     for value in values:
-        if value < 1 or value > 8:
+        if value < 1 or value > 10:
             raise ValueError(f"Sensor count out of range: {value}")
         if value not in seen:
             seen.add(value)
@@ -772,6 +896,7 @@ class StreamAttempt:
         self.outcome = ""
         self.reason = ""
         self.status_warning = ""
+        self.disconnect_warning = ""
         self.connected: list[str] = []
         self.address_by_sensor_id: dict[int, str] = {}
         self.stats: dict[str, SensorStats] = {}
@@ -781,10 +906,13 @@ class StreamAttempt:
         self.stream_frames_unknown_sensor_id = 0
         self.unknown_sensor_ids = {}
         self.post_stop_drain_frames = 0
+        self.stream_start_issued_addresses: list[str] = []
         self.stop_completed = False
         self.disconnect_completed = False
         self.frame_csv_file = None
         self.frame_csv_writer = None
+        self.post_stop_drain_by_address = Counter()
+        self.post_stop_drain_unknown_sensor_ids = Counter()
 
     def _open_frame_csv(self):
         if not self.args.frame_csv:
@@ -874,8 +1002,11 @@ class StreamAttempt:
     def run(self):
         self._open_frame_csv()
         try:
+            self.client.phase = "reset_session"
             self.client.reset_session(timeout_s=5.0)
+            self.client.phase = "hello"
             self.client.hello()
+            self.client.phase = "scan"
             print(f"Scanning for up to {self.args.scan_timeout_ms}ms...")
             matches = self.client.discover_movella(self.args.scan_timeout_ms)
             selected = select_discovered_addresses(matches, self.sensor_count)
@@ -886,6 +1017,7 @@ class StreamAttempt:
                 for index, address in enumerate(selected)
             }
 
+            self.client.phase = "connect"
             self.connected, sensor_id_by_address = self.client.connect(
                 selected,
                 timeout_s=self.args.connect_attempt_timeout_s,
@@ -901,34 +1033,48 @@ class StreamAttempt:
 
             # Wait for connection stability before configuring.
             if self.args.post_connect_settle_seconds > 0:
+                self.client.phase = "post_connect_settle"
                 print(
                     "All sensors connected. "
                     f"Waiting {self.args.post_connect_settle_seconds:.1f}s for BLE links/params to settle."
                 )
                 time.sleep(self.args.post_connect_settle_seconds)    
             try:
+                self.client.phase = "configure"
                 self.configure()
                 if self.args.post_connect_settle_seconds > 0:
+                    self.client.phase = "post_config_settle"
                     print(
                         "All sensors configured. "
                         f"Waiting {self.args.post_connect_settle_seconds:.1f}s before stream start."
                     )
                     time.sleep(self.args.post_connect_settle_seconds)
+                self.client.phase = "start_streams"
                 self.start_streams()
+                self.client.phase = "monitor"
                 self.monitor()
+                self.client.phase = "stop_streams"
                 self.stop_streams()
+                self.client.phase = "post_stop_drain"
                 self.drain_after_stop()
                 try:
+                    self.client.phase = "get_status"
                     self.client.get_status(
                         timeout_s=10.0,
                     )
                 except TimeoutError as exc:
                     self.status_warning = str(exc)
                     print(f"STATUS WARNING: {exc}")
-                self.client.disconnect(
-                    self.connected,
-                    timeout_s=self.args.disconnect_timeout_s,
-                )
+                try:
+                    self.client.phase = "disconnect"
+                    self.client.disconnect(
+                        self.connected,
+                        timeout_s=self.args.disconnect_timeout_s,
+                        allow_timeout=True,
+                    )
+                except Exception as exc:
+                    self.disconnect_warning = str(exc)
+                    print(f"DISCONNECT WARNING: {exc}")
                 self.disconnect_completed = True
                 if not self.outcome:
                     self.outcome = "success"
@@ -936,33 +1082,86 @@ class StreamAttempt:
                 self.outcome = "retry"
                 self.reason = str(exc)
                 print(f"FAILED: {exc}")
+                self.client.phase = "cleanup"
                 self.cleanup()
         finally:
+            self.client.phase = "idle"
             self._close_frame_csv()
 
     def configure(self):
+        subscribe_timeout_s = max(
+            self.args.subscribe_timeout_s,
+            min(20.0, 6.0 + (self.sensor_count * 1.5)),
+        )
+
         for address in self.connected:
             print(f"CONFIG {address}: pre-stop")
+            if address in self.client.disconnected_addresses:
+                raise RuntimeError(
+                    f"cannot pre-stop disconnected sensor address={address}"
+                )
             try:
                 self.client.write(
                     address,
                     MOVELLA_START_STOP_STREAM_UUID,
                     MOVELLA_STOP_HEX,
                     timeout_s=self.args.write_timeout_s,
-                    without_response=self.args.without_response,
+                    without_response=True,
                 )
                 time.sleep(0.25)
             except Exception as exc:
+                if address in self.client.disconnected_addresses:
+                    raise RuntimeError(
+                        f"sensor disconnected before pre-stop complete "
+                        f"address={address}: {exc}"
+                    ) from exc
+                if "gatt_write_failed (-3)" in str(exc):
+                    raise RuntimeError(
+                        f"gateway lost connection before configure for address={address}: {exc}"
+                    ) from exc
                 print(f"PRE-STOP WARNING: {address}: {exc}")
 
         for address in self.connected:
             print(f"CONFIG {address}: subscribe")
-            self.client.subscribe_binary(
-                address,
-                MOVELLA_LONG_PAYLOAD_UUID,
-                timeout_s=self.args.subscribe_timeout_s,
-            )
-            time.sleep(0.25)
+            if address in self.client.disconnected_addresses:
+                raise RuntimeError(
+                    f"cannot subscribe disconnected sensor address={address}"
+                )
+            subscribe_error: Exception | None = None
+            for attempt in range(1, 3):
+                try:
+                    self.client.subscribe_binary(
+                        address,
+                        MOVELLA_LONG_PAYLOAD_UUID,
+                        timeout_s=subscribe_timeout_s,
+                    )
+                    subscribe_error = None
+                    break
+                except Exception as exc:
+                    subscribe_error = exc
+                    if address in self.client.disconnected_addresses:
+                        raise RuntimeError(
+                            f"sensor disconnected before subscribe_complete "
+                            f"address={address}: {exc}"
+                        ) from exc
+                    if (
+                        "subscribe_failed (-3)" in str(exc)
+                        or "subscription_register_failed (-2)" in str(exc)
+                    ):
+                        raise RuntimeError(
+                            f"gateway lost subscribe state for address={address}: {exc}"
+                        ) from exc
+                    print(
+                        f"SUBSCRIBE WARNING: {address}: "
+                        f"attempt={attempt} failed: {exc}"
+                    )
+                    time.sleep(0.3)
+
+            if subscribe_error is not None:
+                raise RuntimeError(
+                    f"subscribe failed address={address} after retries: {subscribe_error}"
+                )
+            time.sleep(0.75)
 
         for address in self.connected:
             print(f"CONFIG {address}: set-rate {self.args.sampling_rate_hz}Hz")
@@ -991,6 +1190,7 @@ class StreamAttempt:
                 timeout_s=self.args.write_timeout_s,
                 without_response=self.args.without_response,
             )
+            self.stream_start_issued_addresses.append(address)
             if write_complete_time is not None:
                 self.stats[address].stream_start_command_time = write_complete_time
             self._drain_pending_stream_frames(timeout_s=0.02)
@@ -1010,19 +1210,35 @@ class StreamAttempt:
         if self.stop_completed:
             return
 
-        print("Stopping stream now.")
+        if not self.stream_start_issued_addresses:
+            self.stop_completed = True
+            print("Stopping stream skipped: no stream start commands were issued.")
+            return
 
-        for address in self.connected:
+        print("Stopping stream now.")
+        stop_timeout_s = max(5.5, self.args.write_timeout_s)
+
+        for address in self.stream_start_issued_addresses:
             print(f"STOP STREAM: {address}")
             try:
-                self.client.write(
+                write_complete_time = self.client.write(
                     address,
                     MOVELLA_START_STOP_STREAM_UUID,
                     MOVELLA_STOP_HEX,
                     timeout_s=self.args.write_timeout_s,
                     without_response=self.args.without_response,
                 )
-                time.sleep(0.02)
+
+                if write_complete_time is None:
+                    print(
+                        f"STOP STREAM WARNING: {address}: "
+                        f"timed out waiting for write_complete after {stop_timeout_s:.1f}s"
+                    )
+                else:
+                    print(f"STOP STREAM COMPLETE: {address}")
+
+                time.sleep(0.05)
+
             except Exception as exc:
                 print(f"STOP STREAM FAILED: {address}: {exc}")
 
@@ -1057,6 +1273,12 @@ class StreamAttempt:
                 self.post_stop_drain_frames += 1
                 quiet_deadline = time.monotonic() + quiet_window_s
 
+                address = self.address_by_sensor_id.get(item.sensor_id)
+                if address is None:
+                    self.post_stop_drain_unknown_sensor_ids[item.sensor_id] += 1
+                else:
+                    self.post_stop_drain_by_address[address] += 1
+
             self._handle_item(item_type, item)
 
         print("Post-stop drain reached max_drain timeout.")
@@ -1072,7 +1294,11 @@ class StreamAttempt:
 
         if not self.disconnect_completed:
             try:
-                self.client.disconnect(self.connected, timeout_s=self.args.disconnect_timeout_s)
+                self.client.disconnect(
+                    self.connected,
+                    timeout_s=self.args.disconnect_timeout_s,
+                    allow_timeout=True,
+                )
                 self.disconnect_completed = True
             except Exception as exc:
                 print(f"Cleanup disconnect incomplete: {exc}")
@@ -1247,12 +1473,24 @@ class StreamAttempt:
         print(f"Reason: {self.reason or 'n/a'}")
         if self.status_warning:
             print(f"Status warning: {self.status_warning}")
+        if self.disconnect_warning:
+            print(f"Disconnect warning: {self.disconnect_warning}")
         print(
             f"Stream frames seen={self.stream_frames_seen} "
             f"unknown_sensor_id_frames={self.stream_frames_unknown_sensor_id} "
             f"unknown_sensor_ids={self.unknown_sensor_ids}"
         )
         print(f"Post-stop drain frames={self.post_stop_drain_frames}")
+        if self.post_stop_drain_by_address:
+            print("Post-stop drain by address:")
+            for address, count in self.post_stop_drain_by_address.most_common():
+                location = self.stats.get(address).location if address in self.stats else None
+                print(f"  {address} location={location} frames={count}")
+
+        if self.post_stop_drain_unknown_sensor_ids:
+            print("Post-stop drain unknown sensor ids:")
+            for sensor_id, count in self.post_stop_drain_unknown_sensor_ids.most_common():
+                print(f"  sensor_id={sensor_id} frames={count}")
         print(
             "Host parser summary "
             f"checksum_failures={self.client.stream_checksum_failures} "
@@ -1275,7 +1513,10 @@ class StreamAttempt:
             )
         for address in sorted(self.stats):
             stats = self.stats[address]
-            gateway_stats = self.client.gateway_ble_rx_stats.get(address, {})
+            gateway_stats = self.client.gateway_ble_rx_stats.get(
+                self.client._normalize_address(address),
+                {},
+            )
             ttff = "n/a" if stats.time_to_first_packet_ms is None else f"{stats.time_to_first_packet_ms:.1f}"
             print(
                 f"{address} location={stats.location} "
@@ -1296,6 +1537,8 @@ class StreamAttempt:
                 f"estimated_dropped_packets={stats.estimated_dropped_packets} "
                 f"gateway_timestamp_resets={gateway_stats.get('timestamp_reset_events')} "
                 f"gateway_timestamp_discontinuities={gateway_stats.get('timestamp_discontinuity_events')} "
+                f"gateway_lookup_misses={gateway_stats.get('subscription_lookup_misses')} "
+                f"gateway_json_fallbacks={gateway_stats.get('json_fallback_notifications')} "
                 f"gateway_queue_accepted={gateway_stats.get('notification_queue_accepted')} "
                 f"gateway_queue_dropped={gateway_stats.get('notification_queue_dropped')} "
                 f"gateway_queue_flushed={gateway_stats.get('notification_queue_flushed')} "

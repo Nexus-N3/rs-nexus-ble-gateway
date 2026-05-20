@@ -194,9 +194,6 @@ static void on_gateway_command(const gateway_command_t *command)
 
     case GW_CMD_RESET_SESSION: {
         int rc = ble_scheduler_reset_session();
-        if (gateway_interface_reset_transport_state() != 0 && rc == 0) {
-            rc = -1;
-        }
 
         if (rc != 0) {
             gateway_interface_send_error(

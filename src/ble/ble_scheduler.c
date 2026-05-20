@@ -3,6 +3,7 @@
 #include "../interface/gateway_interface.h"
 #include "../config/gateway_config.h"
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <zephyr/kernel.h>
 
@@ -22,7 +23,7 @@ static gateway_sensor_t g_sensors[GATEWAY_MAX_SENSORS];
 static uint8_t g_sensor_count = 0;
 #define NOTIFICATION_QUEUE_DEPTH 128
 #define NOTIFICATION_FLUSH_BUDGET 8
-#define ACTIVE_SUBSCRIPTION_MAX 16
+#define ACTIVE_SUBSCRIPTION_MAX 32
 
 typedef struct {
     bool used;
@@ -34,6 +35,8 @@ typedef struct {
     uint32_t timestamp_discontinuity_events;
     uint32_t last_sensor_timestamp_us;
     bool has_last_sensor_timestamp;
+    uint32_t subscription_lookup_misses;
+    uint32_t json_fallback_notifications;
     uint32_t notification_queue_accepted;
     uint32_t notification_queue_dropped;
     uint32_t notification_queue_flushed;
@@ -92,6 +95,15 @@ typedef struct {
 } active_subscription_t;
 
 static active_subscription_t g_active_subscriptions[ACTIVE_SUBSCRIPTION_MAX];
+static uint32_t g_subscription_table_overflow_count;
+
+typedef struct {
+    bool used;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
+} emitted_unmapped_warning_t;
+
+static emitted_unmapped_warning_t g_emitted_unmapped_warnings[ACTIVE_SUBSCRIPTION_MAX];
 
 /*
  * Current gap estimation assumes the first 4 payload bytes encode a little-endian
@@ -131,6 +143,53 @@ static notification_rx_stats_t *find_or_alloc_notification_rx_stats(
     strncpy(free_slot->address, address, sizeof(free_slot->address) - 1);
 
     return free_slot;
+}
+
+static bool uuid_equals(const char *lhs, const char *rhs)
+{
+    if (lhs == NULL || rhs == NULL) {
+        return false;
+    }
+
+    return strcasecmp(lhs, rhs) == 0;
+}
+
+static bool should_emit_unmapped_warning(
+    const char *address,
+    const char *characteristic_uuid
+)
+{
+    if (address == NULL || characteristic_uuid == NULL) {
+        return false;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_emitted_unmapped_warnings); i++) {
+        if (g_emitted_unmapped_warnings[i].used &&
+            strcmp(g_emitted_unmapped_warnings[i].address, address) == 0 &&
+            uuid_equals(g_emitted_unmapped_warnings[i].characteristic_uuid, characteristic_uuid)) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(g_emitted_unmapped_warnings); i++) {
+        if (!g_emitted_unmapped_warnings[i].used) {
+            memset(&g_emitted_unmapped_warnings[i], 0, sizeof(g_emitted_unmapped_warnings[i]));
+            g_emitted_unmapped_warnings[i].used = true;
+            strncpy(
+                g_emitted_unmapped_warnings[i].address,
+                address,
+                sizeof(g_emitted_unmapped_warnings[i].address) - 1
+            );
+            strncpy(
+                g_emitted_unmapped_warnings[i].characteristic_uuid,
+                characteristic_uuid,
+                sizeof(g_emitted_unmapped_warnings[i].characteristic_uuid) - 1
+            );
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static void update_notification_rx_stats(
@@ -216,30 +275,6 @@ static gateway_sensor_t *find_sensor_by_address(const char *address)
     return NULL;
 }
 
-static gateway_sensor_t *allocate_sensor(const ble_discovered_sensor_t *found)
-{
-    gateway_sensor_t *existing = find_sensor_by_address(found->address);
-    if (existing != NULL) {
-        return existing;
-    }
-
-    if (g_sensor_count >= GATEWAY_MAX_SENSORS) {
-        return NULL;
-    }
-
-    gateway_sensor_t *sensor = &g_sensors[g_sensor_count++];
-    memset(sensor, 0, sizeof(*sensor));
-
-    strncpy(sensor->address, found->address, sizeof(sensor->address) - 1);
-    sensor->sensor_type = found->sensor_type;
-    sensor->state = SENSOR_STATE_FOUND;
-    sensor->rssi = found->rssi;
-    sensor->expected_rate_hz = GATEWAY_DEFAULT_STREAM_RATE_HZ;
-    sensor->is_required = true;
-
-    return sensor;
-}
-
 static gateway_sensor_t *ensure_sensor_by_address(const char *address)
 {
     gateway_sensor_t *existing;
@@ -276,39 +311,59 @@ static int sensor_id_for_address(const char *address)
     return -1;
 }
 
-static void clear_active_subscriptions_for_address(const char *address)
-{
-    if (address == NULL) {
-        return;
-    }
-
-    for (size_t i = 0; i < ARRAY_SIZE(g_active_subscriptions); i++) {
-        if (g_active_subscriptions[i].used &&
-            strcmp(g_active_subscriptions[i].address, address) == 0) {
-            memset(&g_active_subscriptions[i], 0, sizeof(g_active_subscriptions[i]));
-        }
-    }
-}
-
-static void register_active_subscription(
+static int register_active_subscription(
     const char *address,
     const char *characteristic_uuid,
-    bool binary_notifications
+    bool binary_notifications,
+    uint8_t *sensor_id_out
 )
 {
-    int sensor_id = sensor_id_for_address(address);
+    gateway_sensor_t *sensor;
+    int sensor_id;
+
+    if (address == NULL || characteristic_uuid == NULL) {
+        return -1;
+    }
+
+    sensor = ensure_sensor_by_address(address);
+    sensor_id = sensor_id_for_address(address);
+
+    if (sensor_id_out != NULL) {
+        *sensor_id_out = 0U;
+    }
 
     if (sensor_id < 0) {
-        return;
+        char line[320];
+
+        snprintf(
+            line,
+            sizeof(line),
+            "{\"type\":\"subscription_register_failed\","
+            "\"address\":\"%s\","
+            "\"characteristic_uuid\":\"%s\","
+            "\"reason\":\"sensor_id_not_found\","
+            "\"sensor_slot_allocated\":%s,"
+            "\"sensor_count\":%u}",
+            address,
+            characteristic_uuid,
+            sensor != NULL ? "true" : "false",
+            (unsigned int)g_sensor_count
+        );
+        gateway_interface_send_json_line(line);
+        return -2;
+    }
+
+    if (sensor_id_out != NULL) {
+        *sensor_id_out = (uint8_t)sensor_id;
     }
 
     for (size_t i = 0; i < ARRAY_SIZE(g_active_subscriptions); i++) {
         if (g_active_subscriptions[i].used &&
             strcmp(g_active_subscriptions[i].address, address) == 0 &&
-            strcmp(g_active_subscriptions[i].characteristic_uuid, characteristic_uuid) == 0) {
+            uuid_equals(g_active_subscriptions[i].characteristic_uuid, characteristic_uuid)) {
             g_active_subscriptions[i].binary_notifications = binary_notifications;
             g_active_subscriptions[i].sensor_id = (uint8_t)sensor_id;
-            return;
+            return 0;
         }
     }
 
@@ -318,15 +373,22 @@ static void register_active_subscription(
             g_active_subscriptions[i].used = true;
             g_active_subscriptions[i].binary_notifications = binary_notifications;
             g_active_subscriptions[i].sensor_id = (uint8_t)sensor_id;
-            strncpy(g_active_subscriptions[i].address, address, sizeof(g_active_subscriptions[i].address) - 1);
+            strncpy(
+                g_active_subscriptions[i].address,
+                address,
+                sizeof(g_active_subscriptions[i].address) - 1
+            );
             strncpy(
                 g_active_subscriptions[i].characteristic_uuid,
                 characteristic_uuid,
                 sizeof(g_active_subscriptions[i].characteristic_uuid) - 1
             );
-            return;
+            return 0;
         }
     }
+
+    g_subscription_table_overflow_count++;
+    return -12;
 }
 
 static active_subscription_t *find_active_subscription(
@@ -337,7 +399,7 @@ static active_subscription_t *find_active_subscription(
     for (size_t i = 0; i < ARRAY_SIZE(g_active_subscriptions); i++) {
         if (g_active_subscriptions[i].used &&
             strcmp(g_active_subscriptions[i].address, address) == 0 &&
-            strcmp(g_active_subscriptions[i].characteristic_uuid, characteristic_uuid) == 0) {
+            uuid_equals(g_active_subscriptions[i].characteristic_uuid, characteristic_uuid)) {
             return &g_active_subscriptions[i];
         }
     }
@@ -441,7 +503,9 @@ int ble_scheduler_init(void)
     memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
     memset(g_notification_queue, 0, sizeof(g_notification_queue));
     memset(g_active_subscriptions, 0, sizeof(g_active_subscriptions));
+    memset(g_emitted_unmapped_warnings, 0, sizeof(g_emitted_unmapped_warnings));
 
+    g_subscription_table_overflow_count = 0;
     g_sensor_count = 0;
     g_connect_queue_count = 0;
     g_connect_queue_index = 0;
@@ -729,6 +793,8 @@ int ble_scheduler_disconnect_all(void)
     g_notification_count = 0;
     g_notification_drop_count = 0;
     memset(g_active_subscriptions, 0, sizeof(g_active_subscriptions));
+    memset(g_emitted_unmapped_warnings, 0, sizeof(g_emitted_unmapped_warnings));
+    g_subscription_table_overflow_count = 0;
     g_state = SCHEDULER_STATE_IDLE;
     return rc;
 }
@@ -759,7 +825,10 @@ int ble_scheduler_reset_session(void)
     g_notification_count = 0;
     g_notification_drop_count = 0;
     memset(g_active_subscriptions, 0, sizeof(g_active_subscriptions));
+    memset(g_emitted_unmapped_warnings, 0, sizeof(g_emitted_unmapped_warnings));
+    g_subscription_table_overflow_count = 0;
     g_state = SCHEDULER_STATE_IDLE;
+    memset(g_notification_rx_stats, 0, sizeof(g_notification_rx_stats));
     return rc;
 }
 
@@ -959,6 +1028,7 @@ void ble_scheduler_tick(void)
         memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
         handled_gatt_op = true;
     } else if (g_pending_gatt_op.pending && g_pending_gatt_op.type == GATT_OP_SUBSCRIBE) {
+        uint8_t sensor_id = 0U;
         int rc = ble_interface_subscribe(
             g_pending_gatt_op.address,
             g_pending_gatt_op.characteristic_uuid
@@ -973,29 +1043,41 @@ void ble_scheduler_tick(void)
                 rc
             );
         } else {
-            char line[256];
-
-            snprintf(
-                line,
-                sizeof(line),
-                "{\"type\":\"subscribe_complete\","
-                "\"request_id\":\"%s\","
-                "\"address\":\"%s\","
-                "\"sensor_id\":%u,"
-                "\"characteristic_uuid\":\"%s\","
-                "\"ok\":true}",
-                g_pending_gatt_op.request_id,
-                g_pending_gatt_op.address,
-                (unsigned int)sensor_id_for_address(g_pending_gatt_op.address),
-                g_pending_gatt_op.characteristic_uuid
-            );
-
-            register_active_subscription(
+            int reg_rc = register_active_subscription(
                 g_pending_gatt_op.address,
                 g_pending_gatt_op.characteristic_uuid,
-                g_pending_gatt_op.binary_notifications
+                g_pending_gatt_op.binary_notifications,
+                &sensor_id
             );
-            gateway_interface_send_json_line(line);
+
+            if (reg_rc != 0) {
+                gateway_interface_send_error(
+                    g_pending_gatt_op.request_id[0] != '\0'
+                        ? g_pending_gatt_op.request_id
+                        : NULL,
+                    "subscription_register_failed",
+                    reg_rc
+                );
+            } else {
+                char line[256];
+
+                snprintf(
+                    line,
+                    sizeof(line),
+                    "{\"type\":\"subscribe_complete\","
+                    "\"request_id\":\"%s\","
+                    "\"address\":\"%s\","
+                    "\"sensor_id\":%u,"
+                    "\"characteristic_uuid\":\"%s\","
+                    "\"ok\":true}",
+                    g_pending_gatt_op.request_id,
+                    g_pending_gatt_op.address,
+                    (unsigned int)sensor_id,
+                    g_pending_gatt_op.characteristic_uuid
+                );
+
+                gateway_interface_send_json_line(line);
+            }
         }
 
         memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
@@ -1003,26 +1085,37 @@ void ble_scheduler_tick(void)
     }
 
     if (handled_gatt_op) {
+        flush_notification_queue(NOTIFICATION_FLUSH_BUDGET);
         return;
     }
 
     flush_notification_queue(NOTIFICATION_FLUSH_BUDGET);
 }
 
-
+#define BLE_RX_STATS_LINE_MAX 1024
 
 void ble_scheduler_report_notification_rx_stats(const char *request_id)
 {
+    char summary_line[256];
     char complete_line[192];
+    uint32_t attempted = 0;
+    uint32_t sent = 0;
+    uint32_t dropped = 0;
+    uint32_t truncated = 0;
+    bool summary_enqueued = false;
+    bool completion_enqueued = false;
 
     for (size_t i = 0; i < ARRAY_SIZE(g_notification_rx_stats); i++) {
-        char line[512];
+        char line[BLE_RX_STATS_LINE_MAX];
+        int n;
 
         if (!g_notification_rx_stats[i].used) {
             continue;
         }
 
-        snprintf(
+        attempted++;
+
+        n = snprintf(
             line,
             sizeof(line),
             "{\"type\":\"ble_notification_rx_stats\","
@@ -1034,6 +1127,8 @@ void ble_scheduler_report_notification_rx_stats(const char *request_id)
             "\"timestamp_reset_events\":%u,"
             "\"timestamp_discontinuity_events\":%u,"
             "\"last_sensor_timestamp_us\":%u,"
+            "\"subscription_lookup_misses\":%u,"
+            "\"json_fallback_notifications\":%u,"
             "\"notification_queue_accepted\":%u,"
             "\"notification_queue_dropped\":%u,"
             "\"notification_queue_flushed\":%u,"
@@ -1049,6 +1144,8 @@ void ble_scheduler_report_notification_rx_stats(const char *request_id)
             (unsigned int)g_notification_rx_stats[i].timestamp_reset_events,
             (unsigned int)g_notification_rx_stats[i].timestamp_discontinuity_events,
             (unsigned int)g_notification_rx_stats[i].last_sensor_timestamp_us,
+            (unsigned int)g_notification_rx_stats[i].subscription_lookup_misses,
+            (unsigned int)g_notification_rx_stats[i].json_fallback_notifications,
             (unsigned int)g_notification_rx_stats[i].notification_queue_accepted,
             (unsigned int)g_notification_rx_stats[i].notification_queue_dropped,
             (unsigned int)g_notification_rx_stats[i].notification_queue_flushed,
@@ -1058,17 +1155,49 @@ void ble_scheduler_report_notification_rx_stats(const char *request_id)
             (unsigned int)g_notification_rx_stats[i].json_forward_dropped
         );
 
-        gateway_interface_send_json_line(line);
+        if (n < 0 || n >= (int)sizeof(line)) {
+            truncated++;
+            dropped++;
+            continue;
+        }
+
+        if (gateway_interface_send_json_line(line) == 0) {
+            sent++;
+        } else {
+            dropped++;
+        }
     }
+
+    snprintf(
+        summary_line,
+        sizeof(summary_line),
+        "{\"type\":\"ble_notification_rx_stats_summary\","
+        "\"request_id\":\"%s\","
+        "\"attempted\":%u,"
+        "\"sent\":%u,"
+        "\"dropped\":%u,"
+        "\"truncated\":%u}",
+        request_id != NULL ? request_id : "",
+        (unsigned int)attempted,
+        (unsigned int)sent,
+        (unsigned int)dropped,
+        (unsigned int)truncated
+    );
+
+    summary_enqueued = gateway_interface_send_json_line(summary_line) == 0;
 
     snprintf(
         complete_line,
         sizeof(complete_line),
         "{\"type\":\"ble_notification_rx_stats_complete\","
-        "\"request_id\":\"%s\"}",
-        request_id != NULL ? request_id : ""
+        "\"request_id\":\"%s\","
+        "\"summary_enqueued\":%s}",
+        request_id != NULL ? request_id : "",
+        summary_enqueued ? "true" : "false"
     );
-    gateway_interface_send_json_line(complete_line);
+
+    completion_enqueued = gateway_interface_send_json_line(complete_line) == 0;
+    (void)completion_enqueued;
 }
 
 
@@ -1076,12 +1205,6 @@ void ble_scheduler_on_sensor_found(const ble_discovered_sensor_t *found)
 {
     if (found == NULL) {
         return;
-    }
-
-    gateway_sensor_t *sensor = allocate_sensor(found);
-    if (sensor != NULL) {
-        sensor->rssi = found->rssi;
-        sensor->state = SENSOR_STATE_FOUND;
     }
 
     gateway_interface_send_scan_result(
@@ -1133,12 +1256,13 @@ void ble_scheduler_on_connected(const char *address, uint16_t conn_handle)
 void ble_scheduler_on_disconnected(const char *address, int reason)
 {
     gateway_sensor_t *sensor = find_sensor_by_address(address);
+    uint8_t active_connection_count = ble_interface_active_connection_count();
     if (sensor != NULL) {
         sensor->state = SENSOR_STATE_DISCONNECTED;
         sensor->is_connected = false;
         sensor->is_streaming = false;
     }
-    clear_active_subscriptions_for_address(address);
+    //clear_active_subscriptions_for_address(address);
 
     char line[192];
     const char *request_id =
@@ -1152,9 +1276,11 @@ void ble_scheduler_on_disconnected(const char *address, int reason)
         "{\"type\":\"sensor_disconnected\","
         "\"request_id\":\"%s\","
         "\"address\":\"%s\","
+        "\"active_connection_count\":%u,"
         "\"reason\":%d}",
         request_id,
         address != NULL ? address : "",
+        (unsigned int)active_connection_count,
         reason
     );
     gateway_interface_send_json_line(line);
@@ -1195,6 +1321,7 @@ void ble_scheduler_on_notification(
     pending_notification_t *slot;
     unsigned int key;
     active_subscription_t *subscription;
+    notification_rx_stats_t *stats;
 
     if (address == NULL || characteristic_uuid == NULL || payload == NULL) {
         return;
@@ -1207,29 +1334,69 @@ void ble_scheduler_on_notification(
     update_notification_rx_stats(address, payload, payload_len);
 
     subscription = find_active_subscription(address, characteristic_uuid);
-    notification_rx_stats_t *stats = find_or_alloc_notification_rx_stats(address);
+    stats = find_or_alloc_notification_rx_stats(address);
+
+    if (subscription == NULL) {
+        if (stats != NULL) {
+            stats->subscription_lookup_misses++;
+
+            /*
+             * Keep using this existing field for now so the host summary
+             * still exposes the issue, but this is now an unmapped drop,
+             * not a JSON fallback.
+             */
+            stats->json_fallback_notifications++;
+        }
+
+        if (should_emit_unmapped_warning(address, characteristic_uuid)) {
+            char line[256];
+
+            snprintf(
+                line,
+                sizeof(line),
+                "{\"type\":\"subscription_lookup_miss\","
+                "\"address\":\"%s\","
+                "\"characteristic_uuid\":\"%s\","
+                "\"subscription_table_overflow_count\":%u}",
+                address,
+                characteristic_uuid,
+                (unsigned int)g_subscription_table_overflow_count
+            );
+            gateway_interface_send_json_line(line);
+        }
+
+        return;
+    }
 
     key = irq_lock();
     if (g_notification_count >= NOTIFICATION_QUEUE_DEPTH) {
         g_notification_drop_count++;
         irq_unlock(key);
+
         if (stats != NULL) {
             stats->notification_queue_dropped++;
         }
+
         return;
     }
 
     slot = &g_notification_queue[g_notification_tail];
     memset(slot, 0, sizeof(*slot));
     strncpy(slot->address, address, sizeof(slot->address) - 1);
-    strncpy(slot->characteristic_uuid, characteristic_uuid, sizeof(slot->characteristic_uuid) - 1);
-    slot->binary_notifications = subscription != NULL ? subscription->binary_notifications : false;
-    slot->sensor_id = subscription != NULL ? subscription->sensor_id : 0xFF;
+    strncpy(
+        slot->characteristic_uuid,
+        characteristic_uuid,
+        sizeof(slot->characteristic_uuid) - 1
+    );
+
+    slot->binary_notifications = subscription->binary_notifications;
+    slot->sensor_id = subscription->sensor_id;
     slot->payload_len = (uint16_t)payload_len;
     memcpy(slot->payload, payload, payload_len);
     slot->gateway_time_us = gateway_time_us;
 
-    g_notification_tail = (uint16_t)((g_notification_tail + 1U) % NOTIFICATION_QUEUE_DEPTH);
+    g_notification_tail =
+        (uint16_t)((g_notification_tail + 1U) % NOTIFICATION_QUEUE_DEPTH);
     g_notification_count++;
     irq_unlock(key);
 
