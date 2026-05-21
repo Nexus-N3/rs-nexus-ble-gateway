@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-export GATEWAY="$HOME/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway"
+export GATEWAY="$HOME/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble/rs-nexus-ble-gateway"
 export ZEPHYR_WORKSPACE="$HOME/Desktop/zephyr-main"
 export ZEPHYR_BASE="$ZEPHYR_WORKSPACE/zephyr"
 export ZEPHYR_SDK_INSTALL_DIR="$HOME/zephyr-sdk-1.0.1"
