@@ -11,7 +11,7 @@
 - receive sensor data as JSON notifications or compact binary stream frames
 - query gateway transport and BLE RX statistics
 
-The current validated target for the host tooling is up to 9 simultaneous Movella DOT links at 60 Hz.
+The current validated target for the host tooling is up to 10 simultaneous Movella DOT links at 60 Hz.
 
 ## What The Gateway Does
 
