@@ -29,12 +29,9 @@ typedef struct {
     bool used;
     char address[GATEWAY_MAX_ADDRESS_LEN];
     uint32_t notification_count;
-    uint32_t timestamp_gap_events;
-    uint32_t estimated_dropped_packets;
-    uint32_t timestamp_reset_events;
-    uint32_t timestamp_discontinuity_events;
-    uint32_t last_sensor_timestamp_us;
-    bool has_last_sensor_timestamp;
+    uint64_t first_gateway_timestamp_us;
+    uint64_t last_gateway_timestamp_us;
+    bool has_gateway_timestamp;
     uint32_t subscription_lookup_misses;
     uint32_t json_fallback_notifications;
     uint32_t notification_queue_accepted;
@@ -104,14 +101,6 @@ typedef struct {
 } emitted_unmapped_warning_t;
 
 static emitted_unmapped_warning_t g_emitted_unmapped_warnings[ACTIVE_SUBSCRIPTION_MAX];
-
-/*
- * Current gap estimation assumes the first 4 payload bytes encode a little-endian
- * sensor timestamp in microseconds with an expected cadence close to 60 Hz.
- */
-#define SENSOR_TIMESTAMP_EXPECTED_DELTA_US 16667U
-#define SENSOR_TIMESTAMP_GAP_THRESHOLD_US 25000U
-#define SENSOR_TIMESTAMP_MAX_COUNTED_GAP_US 1000000U
 
 static notification_rx_stats_t *find_or_alloc_notification_rx_stats(
     const char *address
@@ -194,73 +183,22 @@ static bool should_emit_unmapped_warning(
 
 static void update_notification_rx_stats(
     const char *address,
-    const uint8_t *payload,
-    size_t payload_len
+    uint64_t gateway_time_us
 )
 {
     notification_rx_stats_t *stats;
-    uint32_t timestamp_us;
-    uint32_t previous_timestamp_us;
-    uint32_t delta_us;
-    uint32_t missing_packets;
-
-    if (payload == NULL || payload_len < 4) {
-        return;
-    }
 
     stats = find_or_alloc_notification_rx_stats(address);
     if (stats == NULL) {
         return;
     }
 
-    timestamp_us =
-        ((uint32_t)payload[0]) |
-        ((uint32_t)payload[1] << 8) |
-        ((uint32_t)payload[2] << 16) |
-        ((uint32_t)payload[3] << 24);
-
     stats->notification_count++;
-
-    if (!stats->has_last_sensor_timestamp) {
-        stats->last_sensor_timestamp_us = timestamp_us;
-        stats->has_last_sensor_timestamp = true;
-        return;
+    if (!stats->has_gateway_timestamp) {
+        stats->first_gateway_timestamp_us = gateway_time_us;
+        stats->has_gateway_timestamp = true;
     }
-
-    previous_timestamp_us = stats->last_sensor_timestamp_us;
-
-    if (timestamp_us < previous_timestamp_us) {
-        stats->timestamp_reset_events++;
-        stats->last_sensor_timestamp_us = timestamp_us;
-        return;
-    }
-
-    delta_us = timestamp_us - previous_timestamp_us;
-    stats->last_sensor_timestamp_us = timestamp_us;
-
-    if (delta_us <= SENSOR_TIMESTAMP_GAP_THRESHOLD_US) {
-        return;
-    }
-
-    if (delta_us > SENSOR_TIMESTAMP_MAX_COUNTED_GAP_US) {
-        stats->timestamp_discontinuity_events++;
-        return;
-    }
-
-    missing_packets =
-        (delta_us + (SENSOR_TIMESTAMP_EXPECTED_DELTA_US / 2U)) /
-        SENSOR_TIMESTAMP_EXPECTED_DELTA_US;
-
-    if (missing_packets > 0U) {
-        missing_packets -= 1U;
-    }
-
-    if (missing_packets == 0U) {
-        return;
-    }
-
-    stats->timestamp_gap_events++;
-    stats->estimated_dropped_packets += missing_packets;
+    stats->last_gateway_timestamp_us = gateway_time_us;
 }
 
 
@@ -1122,11 +1060,8 @@ void ble_scheduler_report_notification_rx_stats(const char *request_id)
             "\"request_id\":\"%s\","
             "\"address\":\"%s\","
             "\"notification_count\":%u,"
-            "\"timestamp_gap_events\":%u,"
-            "\"estimated_dropped_packets\":%u,"
-            "\"timestamp_reset_events\":%u,"
-            "\"timestamp_discontinuity_events\":%u,"
-            "\"last_sensor_timestamp_us\":%u,"
+            "\"first_gateway_timestamp_us\":%llu,"
+            "\"last_gateway_timestamp_us\":%llu,"
             "\"subscription_lookup_misses\":%u,"
             "\"json_fallback_notifications\":%u,"
             "\"notification_queue_accepted\":%u,"
@@ -1139,11 +1074,8 @@ void ble_scheduler_report_notification_rx_stats(const char *request_id)
             request_id != NULL ? request_id : "",
             g_notification_rx_stats[i].address,
             (unsigned int)g_notification_rx_stats[i].notification_count,
-            (unsigned int)g_notification_rx_stats[i].timestamp_gap_events,
-            (unsigned int)g_notification_rx_stats[i].estimated_dropped_packets,
-            (unsigned int)g_notification_rx_stats[i].timestamp_reset_events,
-            (unsigned int)g_notification_rx_stats[i].timestamp_discontinuity_events,
-            (unsigned int)g_notification_rx_stats[i].last_sensor_timestamp_us,
+            (unsigned long long)g_notification_rx_stats[i].first_gateway_timestamp_us,
+            (unsigned long long)g_notification_rx_stats[i].last_gateway_timestamp_us,
             (unsigned int)g_notification_rx_stats[i].subscription_lookup_misses,
             (unsigned int)g_notification_rx_stats[i].json_fallback_notifications,
             (unsigned int)g_notification_rx_stats[i].notification_queue_accepted,
@@ -1331,7 +1263,7 @@ void ble_scheduler_on_notification(
         payload_len = GATEWAY_MAX_FRAME_PAYLOAD;
     }
 
-    update_notification_rx_stats(address, payload, payload_len);
+    update_notification_rx_stats(address, gateway_time_us);
 
     subscription = find_active_subscription(address, characteristic_uuid);
     stats = find_or_alloc_notification_rx_stats(address);

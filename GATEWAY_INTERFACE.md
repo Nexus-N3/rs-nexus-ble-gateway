@@ -425,11 +425,8 @@ These values are useful when validating high-rate streaming or diagnosing host b
 `ble_notification_rx_stats` reports per-sensor notification health, including:
 
 - `notification_count`
-- `timestamp_gap_events`
-- `estimated_dropped_packets`
-- `timestamp_reset_events`
-- `timestamp_discontinuity_events`
-- `last_sensor_timestamp_us`
+- `first_gateway_timestamp_us`
+- `last_gateway_timestamp_us`
 - `subscription_lookup_misses`
 - `json_fallback_notifications`
 - `notification_queue_accepted`
@@ -439,6 +436,10 @@ These values are useful when validating high-rate streaming or diagnosing host b
 - `stream_enqueue_dropped`
 - `json_forward_success`
 - `json_forward_dropped`
+
+These fields are transport-oriented gateway diagnostics. They describe what the
+gateway received and forwarded; they do not infer embedded sensor timestamps or
+sensor-side packet loss from payload bytes.
 
 These are the main counters to watch when pushing multiple sensors at 60 Hz.
 
