@@ -1,3 +1,27 @@
-&uart20 {
+/*
+ * Makerdiary nRF54L15 Connect Kit / Nexus N3 Gateway porting notes:
+ *
+ * The Makerdiary board routes the application console / gateway UART through
+ * uart30. The original overlay used uart20, which meant the Python tooling could
+ * open the USB serial device but the firmware never responded.
+ *
+ * Keep this baud rate in sync with NexusBLESdk.DEFAULT_BAUD.
+ */
+&uart30 {
 	current-speed = <1000000>;
+};
+
+/ {
+	/*
+	 * The gateway app expects logical LED aliases led1, led2, and led3.
+	 * The Makerdiary board only exposes one physical LED: led0.
+	 *
+	 * Map all app LED roles to led0 so the common gateway LED driver can build
+	 * and run on this board. The indicators will share the same physical LED.
+	 */
+	aliases {
+		led1 = &led0;
+		led2 = &led0;
+		led3 = &led0;
+	};
 };
