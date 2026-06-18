@@ -62,7 +62,7 @@ static void on_gateway_command(const gateway_command_t *command)
 
         led_on(APP_LED_SCAN);
 
-        rc = ble_scheduler_start_scan(
+        rc = ble_scheduler_start_rf_survey_scan(
             request_id_or_null(command),
             scan_duration_ms
         );

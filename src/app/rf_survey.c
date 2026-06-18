@@ -1,6 +1,7 @@
 
 #include "rf_survey.h" 
 
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -19,6 +20,13 @@ typedef struct {
     int32_t rssi_sum_current_window;
     int8_t min_rssi_current_window;
     int8_t max_rssi_current_window;
+
+    uint32_t observations_total;
+    int32_t rssi_sum_total;
+    int8_t min_rssi_total;
+    int8_t max_rssi_total;
+
+    int64_t first_seen_ms;
     int64_t last_seen_ms;
 } rf_survey_target_t;
 
@@ -35,7 +43,156 @@ typedef struct {
 
 static rf_survey_context_t g_survey;
 
+typedef struct {
+    bool seen;
+    bool seen_total;
+    int32_t avg_rssi;
+    int32_t avg_rssi_total;
+    uint32_t first_seen_age_ms;
+    uint32_t last_seen_age_ms;
+    uint8_t score;
+    const char *quality;
+} rf_survey_target_snapshot_t;
+
 //private helper functions
+
+static uint8_t rf_survey_score_rssi(int32_t rssi_avg)
+{
+    if (rssi_avg >= -45) {
+        return 70;
+    }
+
+    if (rssi_avg <= -85) {
+        return 0;
+    }
+
+    return (uint8_t)(((rssi_avg + 85) * 70) / 40);
+}
+
+static uint8_t rf_survey_score_observations(uint32_t observations)
+{
+    if (observations >= 8) {
+        return 20;
+    }
+
+    return (uint8_t)((observations * 20) / 8);
+}
+
+static uint8_t rf_survey_score_freshness(uint32_t last_seen_age_ms)
+{
+    if (last_seen_age_ms <= RF_SURVEY_FRESH_MS_EXCELLENT) {
+        return RF_SURVEY_FRESH_SCORE_MAX;
+    }
+
+    if (last_seen_age_ms <= RF_SURVEY_FRESH_MS_OK) {
+        return RF_SURVEY_FRESH_SCORE_OK;
+    }
+
+    return 0;
+}
+
+static uint8_t rf_survey_compute_score(
+    bool seen,
+    bool seen_total,
+    int32_t rssi_avg,
+    uint32_t observations,
+    uint32_t last_seen_age_ms
+)
+{
+    uint8_t score = 0;
+
+    if (observations == 0U) {
+        if (!seen_total) {
+            return 0;
+        }
+
+        return rf_survey_score_freshness(last_seen_age_ms);
+    }
+
+    if (!seen) {
+        return 0;
+    }
+
+    score += rf_survey_score_rssi(rssi_avg);
+    score += rf_survey_score_observations(observations);
+    score += rf_survey_score_freshness(last_seen_age_ms);
+
+    if (score > 100) {
+        score = 100;
+    }
+
+    return score;
+}
+
+static const char *rf_survey_quality_label(uint8_t score)
+{
+    if (score == 0U) {
+        return "missing";
+    }
+
+    if (score >= RF_SURVEY_SCORE_EXCELLENT_MIN) {
+        return "excellent";
+    }
+
+    if (score >= RF_SURVEY_SCORE_GOOD_MIN) {
+        return "good";
+    }
+
+    if (score >= RF_SURVEY_SCORE_FAIR_MIN) {
+        return "fair";
+    }
+
+    if (score >= RF_SURVEY_SCORE_POOR_MIN) {
+        return "poor";
+    }
+
+    return "missing";
+}
+
+static void rf_survey_snapshot_target(
+    const rf_survey_target_t *target,
+    int64_t now_ms,
+    rf_survey_target_snapshot_t *snapshot
+)
+{
+    if (target == NULL || snapshot == NULL) {
+        return;
+    }
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->quality = "missing";
+    snapshot->seen = target->observations_current_window > 0U;
+    snapshot->seen_total = target->observations_total > 0U;
+
+    if (snapshot->seen) {
+        snapshot->avg_rssi =
+            target->rssi_sum_current_window /
+            (int32_t)target->observations_current_window;
+    }
+
+    if (snapshot->seen_total) {
+        snapshot->avg_rssi_total =
+            target->rssi_sum_total /
+            (int32_t)target->observations_total;
+    }
+
+    if (target->last_seen_ms > 0 && now_ms >= target->last_seen_ms) {
+        snapshot->last_seen_age_ms = (uint32_t)(now_ms - target->last_seen_ms);
+    }
+
+    if (target->first_seen_ms > 0 && now_ms >= target->first_seen_ms) {
+        snapshot->first_seen_age_ms = (uint32_t)(now_ms - target->first_seen_ms);
+    }
+
+    snapshot->score = rf_survey_compute_score(
+        snapshot->seen,
+        snapshot->seen_total,
+        snapshot->avg_rssi,
+        target->observations_current_window,
+        snapshot->last_seen_age_ms
+    );
+    snapshot->quality = rf_survey_quality_label(snapshot->score);
+}
 
 static const char *rf_survey_state_name(rf_survey_state_t state){
     // returns a pointer to a string literal
@@ -61,6 +218,13 @@ static void rf_survey_reset_target_window(rf_survey_target_t *target)
     target->rssi_sum_current_window = 0;
     target->min_rssi_current_window = 0;
     target->max_rssi_current_window = 0;
+}
+
+static void rf_survey_reset_all_target_windows(void)
+{
+    for (uint8_t i = 0; i < g_survey.target_count; i++) {
+        rf_survey_reset_target_window(&g_survey.targets[i]);
+    }
 }
 
 // returns a point to an rf_survey_target
@@ -120,6 +284,166 @@ static int rf_survey_add_target(const char *address)
     return 0;
 
 }
+
+static void rf_survey_update_target_stats(
+    rf_survey_target_t *target,
+    int8_t rssi,
+    int64_t now_ms
+)
+{
+    if (target == NULL) {
+        return;
+    }
+
+    if (target->observations_current_window == 0) {
+        target->min_rssi_current_window = rssi;
+        target->max_rssi_current_window = rssi;
+    } else {
+        if (rssi < target->min_rssi_current_window) {
+            target->min_rssi_current_window = rssi;
+        }
+
+        if (rssi > target->max_rssi_current_window) {
+            target->max_rssi_current_window = rssi;
+        }
+    }
+
+    target->observations_current_window++;
+    target->rssi_sum_current_window += rssi;
+
+    if (target->observations_total == 0) {
+        target->min_rssi_total = rssi;
+        target->max_rssi_total = rssi;
+        target->first_seen_ms = now_ms;
+    } else {
+        if (rssi < target->min_rssi_total) {
+            target->min_rssi_total = rssi;
+        }
+
+        if (rssi > target->max_rssi_total) {
+            target->max_rssi_total = rssi;
+        }
+    }
+
+    target->observations_total++;
+    target->rssi_sum_total += rssi;
+
+    target->last_seen_ms = now_ms;
+}
+
+static int rf_survey_send_target_status(
+    const char *request_id,
+    const rf_survey_target_t *target,
+    int64_t now_ms
+)
+{
+    char line[512];
+    int line_len;
+    rf_survey_target_snapshot_t snapshot;
+
+    if (target == NULL || !target->used) {
+        return 0;
+    }
+
+    rf_survey_snapshot_target(target, now_ms, &snapshot);
+
+    line_len = snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"rf_survey_target_status\","
+        "\"request_id\":\"%s\","
+        "\"address\":\"%s\","
+        "\"seen\":%s,"
+        "\"observations\":%u,"
+        "\"rssi_avg\":%d,"
+        "\"rssi_min\":%d,"
+        "\"rssi_max\":%d,"
+        "\"observations_total\":%u,"
+        "\"rssi_avg_total\":%d,"
+        "\"rssi_min_total\":%d,"
+        "\"rssi_max_total\":%d,"
+        "\"first_seen_age_ms\":%u,"
+        "\"last_seen_age_ms\":%u,"
+        "\"score\":%u,"
+        "\"quality\":\"%s\"}",
+        request_id != NULL ? request_id : "",
+        target->address,
+        snapshot.seen ? "true" : "false",
+        (unsigned int)target->observations_current_window,
+        (int)snapshot.avg_rssi,
+        (int)target->min_rssi_current_window,
+        (int)target->max_rssi_current_window,
+        (unsigned int)target->observations_total,
+        (int)snapshot.avg_rssi_total,
+        (int)target->min_rssi_total,
+        (int)target->max_rssi_total,
+        (unsigned int)snapshot.first_seen_age_ms,
+        (unsigned int)snapshot.last_seen_age_ms,
+        (unsigned int)snapshot.score,
+        snapshot.quality
+    );
+
+    if (line_len < 0 || line_len >= (int)sizeof(line)) {
+        return -EMSGSIZE;
+    }
+
+    return gateway_interface_send_json_line(line);
+}
+
+static int rf_survey_send_target_final(
+    const char *request_id,
+    const rf_survey_target_t *target,
+    int64_t now_ms
+)
+{
+    char line[512];
+    int line_len;
+    rf_survey_target_snapshot_t snapshot;
+
+    if (target == NULL || !target->used) {
+        return 0;
+    }
+
+    rf_survey_snapshot_target(target, now_ms, &snapshot);
+
+    line_len = snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"rf_survey_target_final\","
+        "\"request_id\":\"%s\","
+        "\"address\":\"%s\","
+        "\"seen\":%s,"
+        "\"seen_total\":%s,"
+        "\"observations_total\":%u,"
+        "\"rssi_avg_total\":%d,"
+        "\"rssi_min_total\":%d,"
+        "\"rssi_max_total\":%d,"
+        "\"first_seen_age_ms\":%u,"
+        "\"last_seen_age_ms\":%u,"
+        "\"score\":%u,"
+        "\"quality\":\"%s\"}",
+        request_id != NULL ? request_id : "",
+        target->address,
+        snapshot.seen ? "true" : "false",
+        snapshot.seen_total ? "true" : "false",
+        (unsigned int)target->observations_total,
+        (int)snapshot.avg_rssi_total,
+        (int)target->min_rssi_total,
+        (int)target->max_rssi_total,
+        (unsigned int)snapshot.first_seen_age_ms,
+        (unsigned int)snapshot.last_seen_age_ms,
+        (unsigned int)snapshot.score,
+        snapshot.quality
+    );
+
+    if (line_len < 0 || line_len >= (int)sizeof(line)) {
+        return -EMSGSIZE;
+    }
+
+    return gateway_interface_send_json_line(line);
+}
+
+// end of private helpers section
 
 void rf_survey_init(void){
     //prepares the rf_survey for use when the gateway starts
@@ -228,8 +552,11 @@ int rf_survey_start(
 }
 
 int rf_survey_stop(const char *request_id){
-
-    char line[192];  // buffer to write out result
+    char line[256];
+    int64_t now_ms;
+    uint32_t elapsed_ms = 0;
+    int line_len;
+    int rc;
 
     if (g_survey.state == RF_SURVEY_STATE_INACTIVE) {
         gateway_interface_send_error(
@@ -241,8 +568,13 @@ int rf_survey_stop(const char *request_id){
     }
 
     g_survey.state = RF_SURVEY_STATE_STOPPING;
+    now_ms = k_uptime_get();
 
-    snprintf(
+    if (g_survey.started_at_ms > 0 && now_ms >= g_survey.started_at_ms) {
+        elapsed_ms = (uint32_t)(now_ms - g_survey.started_at_ms);
+    }
+
+    line_len = snprintf(
         line,
         sizeof(line),
         "{\"type\":\"rf_survey_stopped\","
@@ -254,14 +586,52 @@ int rf_survey_stop(const char *request_id){
         request_id != NULL ? request_id : "",
         rf_survey_state_name(g_survey.state),
         (unsigned int)g_survey.target_count,
-        (unsigned int)(k_uptime_get() - g_survey.started_at_ms)
+        (unsigned int)elapsed_ms
     );
 
+    if (line_len < 0 || line_len >= (int)sizeof(line)) {
+        rc = -EMSGSIZE;
+        goto clear_and_return;
+    }
+
+    rc = gateway_interface_send_json_line(line);
+    if (rc != 0) {
+        goto clear_and_return;
+    }
+
+    for (uint8_t i = 0; i < g_survey.target_count; i++) {
+        rc = rf_survey_send_target_final(
+            request_id,
+            &g_survey.targets[i],
+            now_ms
+        );
+        if (rc != 0) {
+            goto clear_and_return;
+        }
+    }
+
+    line_len = snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"rf_survey_stop_complete\","
+        "\"request_id\":\"%s\","
+        "\"target_count\":%u}",
+        request_id != NULL ? request_id : "",
+        (unsigned int)g_survey.target_count
+    );
+
+    if (line_len < 0 || line_len >= (int)sizeof(line)) {
+        rc = -EMSGSIZE;
+        goto clear_and_return;
+    }
+
+    rc = gateway_interface_send_json_line(line);
+
+clear_and_return:
     memset(&g_survey, 0, sizeof(g_survey));
     g_survey.state = RF_SURVEY_STATE_INACTIVE;
 
-    return gateway_interface_send_json_line(line);
-
+    return rc;
 }
 
 int rf_survey_send_status(const char *request_id)
@@ -269,11 +639,19 @@ int rf_survey_send_status(const char *request_id)
     char line[256];
     int64_t now_ms = k_uptime_get();
     uint32_t elapsed_ms = 0;
+    uint32_t window_elapsed_ms = 0;
 
     if (g_survey.state == RF_SURVEY_STATE_ACTIVE &&
         g_survey.started_at_ms > 0 &&
         now_ms >= g_survey.started_at_ms) {
         elapsed_ms = (uint32_t)(now_ms - g_survey.started_at_ms);
+    }
+
+    if (g_survey.state == RF_SURVEY_STATE_ACTIVE &&
+        g_survey.current_window_started_at_ms > 0 &&
+        now_ms >= g_survey.current_window_started_at_ms) {
+        window_elapsed_ms =
+            (uint32_t)(now_ms - g_survey.current_window_started_at_ms);
     }
 
     snprintf(
@@ -285,6 +663,7 @@ int rf_survey_send_status(const char *request_id)
         "\"state\":\"%s\","
         "\"elapsed_ms\":%u,"
         "\"window_ms\":%u,"
+        "\"window_elapsed_ms\":%u,"
         "\"duration_ms\":%u,"
         "\"target_count\":%u}",
         request_id != NULL ? request_id : "",
@@ -292,7 +671,37 @@ int rf_survey_send_status(const char *request_id)
         rf_survey_state_name(g_survey.state),
         (unsigned int)elapsed_ms,
         (unsigned int)g_survey.window_ms,
+        (unsigned int)window_elapsed_ms,
         (unsigned int)g_survey.duration_ms,
+        (unsigned int)g_survey.target_count
+    );
+
+    int rc;
+
+    rc = gateway_interface_send_json_line(line);
+    if (rc != 0) {
+        return rc;
+    }
+
+    for (uint8_t i = 0; i < g_survey.target_count; i++) {
+        rc = rf_survey_send_target_status(
+            request_id,
+            &g_survey.targets[i],
+            now_ms
+        );
+
+        if (rc != 0) {
+            return rc;
+        }
+    }
+
+    snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"rf_survey_status_complete\","
+        "\"request_id\":\"%s\","
+        "\"target_count\":%u}",
+        request_id != NULL ? request_id : "",
         (unsigned int)g_survey.target_count
     );
 
@@ -303,7 +712,6 @@ void rf_survey_on_sensor_found(const ble_discovered_sensor_t *sensor)
 {
     rf_survey_target_t *target;
 
-    //basic checks
     if (sensor == NULL) {
         return;
     }
@@ -317,48 +725,52 @@ void rf_survey_on_sensor_found(const ble_discovered_sensor_t *sensor)
         return;
     }
 
-    if (target->observations_current_window == 0) {
-        target->min_rssi_current_window = sensor->rssi;
-        target->max_rssi_current_window = sensor->rssi;
-    } else {
-        if (sensor->rssi < target->min_rssi_current_window) {
-            target->min_rssi_current_window = sensor->rssi;
-        }
-
-        if (sensor->rssi > target->max_rssi_current_window) {
-            target->max_rssi_current_window = sensor->rssi;
-        }
-    }
-
-    target->observations_current_window++;
-    target->rssi_sum_current_window += sensor->rssi;
-    target->last_seen_ms = k_uptime_get();
+    rf_survey_update_target_stats(
+        target,
+        sensor->rssi,
+        k_uptime_get()
+    );
 }
 
 void rf_survey_tick(void)
 {
     int64_t now_ms;
+    uint32_t elapsed_ms;
+    uint32_t window_elapsed_ms;
 
     if (g_survey.state != RF_SURVEY_STATE_ACTIVE) {
         return;
     }
 
-    if (g_survey.duration_ms == 0) {
+    now_ms = k_uptime_get();
+
+    if (g_survey.duration_ms > 0) {
+        elapsed_ms = (uint32_t)(now_ms - g_survey.started_at_ms);
+
+        if (elapsed_ms >= g_survey.duration_ms) {
+            g_survey.state = RF_SURVEY_STATE_STOPPING;
+
+            /*
+             * For this first version, do not emit JSON here.
+             * The scan scheduler may also timeout and send scan_complete.
+             * We can decide later whether duration expiry should emit
+             * rf_survey_stopped automatically.
+             */
+            memset(&g_survey, 0, sizeof(g_survey));
+            g_survey.state = RF_SURVEY_STATE_INACTIVE;
+            return;
+        }
+    }
+
+    if (g_survey.window_ms == 0) {
         return;
     }
 
-    now_ms = k_uptime_get();
+    window_elapsed_ms =
+        (uint32_t)(now_ms - g_survey.current_window_started_at_ms);
 
-    if ((uint32_t)(now_ms - g_survey.started_at_ms) >= g_survey.duration_ms) {
-        g_survey.state = RF_SURVEY_STATE_STOPPING;
-
-        /*
-         * For this first version, do not emit JSON here.
-         * The scan scheduler may also timeout and send scan_complete.
-         * We can decide later whether duration expiry should emit
-         * rf_survey_stopped automatically.
-         */
-        memset(&g_survey, 0, sizeof(g_survey));
-        g_survey.state = RF_SURVEY_STATE_INACTIVE;
+    if (window_elapsed_ms >= g_survey.window_ms) {
+        rf_survey_reset_all_target_windows();
+        g_survey.current_window_started_at_ms = now_ms;
     }
 }

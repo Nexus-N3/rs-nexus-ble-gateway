@@ -458,6 +458,30 @@ int ble_scheduler_init(void)
     return 0;
 }
 
+int ble_scheduler_start_rf_survey_scan(const char *request_id, uint32_t timeout_ms)
+{
+    g_state = SCHEDULER_STATE_DISCOVERING;
+
+    if (timeout_ms == 0) {
+        timeout_ms = GATEWAY_DEFAULT_SCAN_TIMEOUT_MS;
+    }
+
+    memset(g_scan_request_id, 0, sizeof(g_scan_request_id));
+
+    if (request_id != NULL) {
+        strncpy(
+            g_scan_request_id,
+            request_id,
+            sizeof(g_scan_request_id) - 1
+        );
+    }
+
+    g_scan_deadline_ms = k_uptime_get() + timeout_ms;
+    g_scan_active = true;
+
+    return ble_interface_start_scan(timeout_ms, true);
+}
+
 int ble_scheduler_start_scan(const char *request_id, uint32_t timeout_ms)
 {
     g_state = SCHEDULER_STATE_DISCOVERING;
@@ -479,7 +503,7 @@ int ble_scheduler_start_scan(const char *request_id, uint32_t timeout_ms)
     g_scan_deadline_ms = k_uptime_get() + timeout_ms;
     g_scan_active = true;
 
-    return ble_interface_start_scan(timeout_ms);
+    return ble_interface_start_scan(timeout_ms, false);
 }
 
 int is_scan_active(void)

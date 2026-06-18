@@ -11,6 +11,16 @@
 #include "../interface/gateway_interface.h"
 #include "../ble/ble_interface.h"
 
+#define RF_SURVEY_SCORE_EXCELLENT_MIN 80U
+#define RF_SURVEY_SCORE_GOOD_MIN      65U
+#define RF_SURVEY_SCORE_FAIR_MIN      45U
+#define RF_SURVEY_SCORE_POOR_MIN      20U
+
+#define RF_SURVEY_FRESH_MS_EXCELLENT 500U
+#define RF_SURVEY_FRESH_MS_OK        1500U
+#define RF_SURVEY_FRESH_SCORE_MAX    10U
+#define RF_SURVEY_FRESH_SCORE_OK     5U
+
 // Define RF Survey states - what is the rf_survery current state?
 typedef enum {
     RF_SURVEY_STATE_INACTIVE = 0,

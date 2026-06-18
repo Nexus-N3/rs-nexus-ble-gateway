@@ -1039,7 +1039,7 @@ int ble_interface_init(const ble_interface_callbacks_t *callbacks)
     return 0;
 }
 
-int ble_interface_start_scan(uint32_t timeout_ms)
+int ble_interface_start_scan(uint32_t timeout_ms, bool allow_duplicates)
 {
     ARG_UNUSED(timeout_ms);
 
@@ -1055,7 +1055,7 @@ int ble_interface_start_scan(uint32_t timeout_ms)
 
     struct bt_le_scan_param scan_param = {
         .type = BT_LE_SCAN_TYPE_ACTIVE, 
-        .options = BT_LE_SCAN_OPT_FILTER_DUPLICATE,
+        .options = allow_duplicates ? 0 : BT_LE_SCAN_OPT_FILTER_DUPLICATE,
         .interval = BT_GAP_SCAN_FAST_INTERVAL,
         .window = BT_GAP_SCAN_FAST_WINDOW,
     };

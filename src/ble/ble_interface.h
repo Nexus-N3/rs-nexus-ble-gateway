@@ -23,9 +23,11 @@ typedef struct {
     ble_notification_cb_t on_notification;
 } ble_interface_callbacks_t;
 
+
 int ble_interface_init(const ble_interface_callbacks_t *callbacks);
 
-int ble_interface_start_scan(uint32_t timeout_ms);
+int ble_interface_start_scan(uint32_t timeout_ms, bool allow_duplicates);
+
 int ble_interface_stop_scan(void);
 
 int ble_interface_connect(const char *address);
