@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+
 static const char *request_id_or_null(const gateway_command_t *command)
 {
     if (command == NULL || command->request_id[0] == '\0') {
@@ -14,6 +15,7 @@ static const char *request_id_or_null(const gateway_command_t *command)
 
     return command->request_id;
 }
+
 
 static void on_gateway_command(const gateway_command_t *command)
 {
