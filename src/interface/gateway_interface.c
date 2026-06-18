@@ -663,6 +663,53 @@ static void parse_command_line(const char *line, gateway_command_t *command)
         return;
     }
 
+    //RF survey command parsing
+    if (json_type_is(line, "rf_survey_start")) {
+        command->type = GW_CMD_RF_SURVEY_START;
+
+        extract_address_array(
+            line,
+            "targets",
+            command->addresses,
+            &command->address_count,
+            GATEWAY_MAX_SENSORS
+        );
+
+        if (command->address_count == 0) {
+            extract_address_array(
+                line,
+                "addresses",
+                command->addresses,
+                &command->address_count,
+                GATEWAY_MAX_SENSORS
+            );
+        }
+
+        command->window_ms = extract_uint32_field(
+            line,
+            "window_ms",
+            0
+        );
+
+        command->duration_ms = extract_uint32_field(
+            line,
+            "duration_ms",
+            0
+        );
+
+        return;
+    }
+
+    if (json_type_is(line, "rf_survey_status")) {
+        command->type = GW_CMD_RF_SURVEY_STATUS;
+        return;
+    }
+
+    if (json_type_is(line, "rf_survey_stop")) {
+        command->type = GW_CMD_RF_SURVEY_STOP;
+        return;
+    }
+
     if (json_type_is(line, "connect_addresses")) {
         command->type = GW_CMD_CONNECT_ADDRESSES;
 

@@ -19,6 +19,10 @@ typedef enum {
     GW_CMD_GATT_READ,
     GW_CMD_GET_STATUS,
     GW_CMD_RESET_SESSION,
+
+    GW_CMD_RF_SURVEY_START,
+    GW_CMD_RF_SURVEY_STATUS,
+    GW_CMD_RF_SURVEY_STOP,
 } gateway_command_type_t;
 
 typedef enum {
@@ -52,6 +56,8 @@ typedef struct {
     gateway_command_type_t type;
     char request_id[GATEWAY_MAX_REQUEST_ID_LEN];
     uint32_t timeout_ms;
+    uint32_t window_ms; // rf survey
+    uint32_t duration_ms; // rf survey
     bool without_response;
     bool binary_notifications;
     char address[GATEWAY_MAX_ADDRESS_LEN];

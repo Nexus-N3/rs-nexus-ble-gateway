@@ -1,8 +1,10 @@
 #include "gateway.h"
+#include "rf_survey.h"
 #include "../interface/gateway_interface.h"
 #include "../ble/ble_interface.h"
 #include "../ble/ble_scheduler.h"
 #include "../hardware/led.h"
+
 
 #include <stddef.h>
 #include <stdio.h>
@@ -49,6 +51,58 @@ static void on_gateway_command(const gateway_command_t *command)
             led_off(APP_LED_SCAN);
             ble_scheduler_stop_scan();
         }
+        break;
+
+    //RF Survey CASES
+    case GW_CMD_RF_SURVEY_START: {
+        int rc;
+
+        uint32_t scan_duration_ms =
+            command->duration_ms != 0 ? command->duration_ms : 60000U;
+
+        led_on(APP_LED_SCAN);
+
+        rc = ble_scheduler_start_scan(
+            request_id_or_null(command),
+            scan_duration_ms
+        );
+
+        if (rc != 0) {
+            led_off(APP_LED_SCAN);
+
+            gateway_interface_send_error(
+                request_id_or_null(command),
+                "rf_survey_scan_start_failed",
+                rc
+            );
+
+            break;
+        }
+
+        rc = rf_survey_start(
+            request_id_or_null(command),
+            command->addresses,
+            command->address_count,
+            command->window_ms,
+            command->duration_ms
+        );
+
+        if (rc != 0) {
+            led_off(APP_LED_SCAN);
+            ble_scheduler_stop_scan();
+        }
+
+        break;
+    }
+
+    case GW_CMD_RF_SURVEY_STATUS:
+        rf_survey_send_status(request_id_or_null(command));
+        break;
+
+    case GW_CMD_RF_SURVEY_STOP:
+        led_off(APP_LED_SCAN);
+        ble_scheduler_stop_scan();
+        rf_survey_stop(request_id_or_null(command));
         break;
 
     case GW_CMD_CONNECT_ADDRESSES: {
@@ -233,7 +287,9 @@ static void on_gateway_command(const gateway_command_t *command)
 
 static void on_ble_sensor_found(const ble_discovered_sensor_t *sensor)
 {
+    rf_survey_on_sensor_found(sensor);  //we should only do that if the survey is active?
     ble_scheduler_on_sensor_found(sensor);
+
 }
 
 static void on_ble_connected(const char *address, uint16_t conn_handle)
@@ -282,6 +338,7 @@ int gateway_app_init(void)
     }
 
     ble_scheduler_init();
+    rf_survey_init(); // new rf survey module
 
     gateway_interface_send_ready();
 
@@ -292,4 +349,5 @@ void gateway_app_run_once(void)
 {
     gateway_interface_poll();
     ble_scheduler_tick();
+    rf_survey_tick();
 }
