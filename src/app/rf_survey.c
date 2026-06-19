@@ -28,6 +28,22 @@ typedef struct {
 
     int64_t first_seen_ms;
     int64_t last_seen_ms;
+
+    //trend parameters
+    bool has_previous_window_score;
+    uint8_t previous_window_score;
+    uint8_t last_reported_score;
+
+    //survey variation
+    bool has_score_history;
+
+    uint8_t best_score;
+    uint8_t worst_score;
+    uint32_t score_sum;
+    uint32_t score_sample_count;
+
+    uint32_t best_score_elapsed_ms;
+    uint32_t worst_score_elapsed_ms;
 } rf_survey_target_t;
 
 // the state of the RF survey
@@ -331,15 +347,95 @@ static void rf_survey_update_target_stats(
     target->last_seen_ms = now_ms;
 }
 
+static const char *rf_survey_trend_label(
+    uint8_t current_score,
+    uint8_t previous_score,
+    bool has_previous_score
+)
+{
+    if (!has_previous_score) {
+        return "unknown";
+    }
+
+    if (current_score >= previous_score + RF_SURVEY_TREND_DELTA_MIN) {
+        return "improving";
+    }
+
+    if (previous_score >= current_score + RF_SURVEY_TREND_DELTA_MIN) {
+        return "degrading";
+    }
+
+    return "stable";
+}
+
+static void rf_survey_update_score_history(
+    rf_survey_target_t *target,
+    uint8_t score,
+    uint32_t elapsed_ms
+)
+{
+    if (target == NULL) {
+        return;
+    }
+
+    if (!target->has_score_history) {
+        target->has_score_history = true;
+        target->best_score = score;
+        target->worst_score = score;
+        target->best_score_elapsed_ms = elapsed_ms;
+        target->worst_score_elapsed_ms = elapsed_ms;
+    }
+
+    if (score > target->best_score) {
+        target->best_score = score;
+        target->best_score_elapsed_ms = elapsed_ms;
+    }
+
+    if (score < target->worst_score) {
+        target->worst_score = score;
+        target->worst_score_elapsed_ms = elapsed_ms;
+    }
+
+    target->score_sum += score;
+    target->score_sample_count++;
+}
+
+static uint8_t rf_survey_mean_score(const rf_survey_target_t *target)
+{
+    if (target == NULL || target->score_sample_count == 0U) {
+        return 0U;
+    }
+
+    return (uint8_t)(target->score_sum / target->score_sample_count);
+}
+
 static int rf_survey_send_target_status(
     const char *request_id,
-    const rf_survey_target_t *target,
+    rf_survey_target_t *target,
     int64_t now_ms
 )
 {
     char line[512];
     int line_len;
     rf_survey_target_snapshot_t snapshot;
+
+    const char *trend;
+    uint32_t elapsed_ms = 0;
+
+    rf_survey_snapshot_target(target, now_ms, &snapshot);
+
+    if (g_survey.started_at_ms > 0 && now_ms >= g_survey.started_at_ms) {
+        elapsed_ms = (uint32_t)(now_ms - g_survey.started_at_ms);
+    }
+
+    trend = rf_survey_trend_label(
+        snapshot.score,
+        target->previous_window_score,
+        target->has_previous_window_score
+    );
+
+    target->last_reported_score = snapshot.score;
+    rf_survey_update_score_history(target, snapshot.score, elapsed_ms);
 
     if (target == NULL || !target->used) {
         return 0;
@@ -365,7 +461,14 @@ static int rf_survey_send_target_status(
         "\"first_seen_age_ms\":%u,"
         "\"last_seen_age_ms\":%u,"
         "\"score\":%u,"
-        "\"quality\":\"%s\"}",
+        "\"quality\":\"%s\","
+        "\"trend\":\"%s\","
+        "\"best_score\":%u,"
+        "\"worst_score\":%u,"
+        "\"mean_score\":%u,"
+        "\"score_sample_count\":%u,"
+        "\"best_score_elapsed_ms\":%u,"
+        "\"worst_score_elapsed_ms\":%u}",
         request_id != NULL ? request_id : "",
         target->address,
         snapshot.seen ? "true" : "false",
@@ -380,7 +483,14 @@ static int rf_survey_send_target_status(
         (unsigned int)snapshot.first_seen_age_ms,
         (unsigned int)snapshot.last_seen_age_ms,
         (unsigned int)snapshot.score,
-        snapshot.quality
+        snapshot.quality,
+        trend,
+        (unsigned int)target->best_score,
+        (unsigned int)target->worst_score,
+        (unsigned int)rf_survey_mean_score(target),
+        (unsigned int)target->score_sample_count,
+        (unsigned int)target->best_score_elapsed_ms,
+        (unsigned int)target->worst_score_elapsed_ms
     );
 
     if (line_len < 0 || line_len >= (int)sizeof(line)) {
@@ -399,12 +509,19 @@ static int rf_survey_send_target_final(
     char line[512];
     int line_len;
     rf_survey_target_snapshot_t snapshot;
+    const char *trend;
 
     if (target == NULL || !target->used) {
         return 0;
     }
 
     rf_survey_snapshot_target(target, now_ms, &snapshot);
+
+    trend = rf_survey_trend_label(
+        snapshot.score,
+        target->previous_window_score,
+        target->has_previous_window_score
+    );
 
     line_len = snprintf(
         line,
@@ -421,7 +538,14 @@ static int rf_survey_send_target_final(
         "\"first_seen_age_ms\":%u,"
         "\"last_seen_age_ms\":%u,"
         "\"score\":%u,"
-        "\"quality\":\"%s\"}",
+        "\"quality\":\"%s\","
+        "\"trend\":\"%s\","
+        "\"best_score\":%u,"
+        "\"worst_score\":%u,"
+        "\"mean_score\":%u,"
+        "\"score_sample_count\":%u,"
+        "\"best_score_elapsed_ms\":%u,"
+        "\"worst_score_elapsed_ms\":%u}",
         request_id != NULL ? request_id : "",
         target->address,
         snapshot.seen ? "true" : "false",
@@ -433,7 +557,14 @@ static int rf_survey_send_target_final(
         (unsigned int)snapshot.first_seen_age_ms,
         (unsigned int)snapshot.last_seen_age_ms,
         (unsigned int)snapshot.score,
-        snapshot.quality
+        snapshot.quality,
+        trend,
+        (unsigned int)target->best_score,
+        (unsigned int)target->worst_score,
+        (unsigned int)rf_survey_mean_score(target),
+        (unsigned int)target->score_sample_count,
+        (unsigned int)target->best_score_elapsed_ms,
+        (unsigned int)target->worst_score_elapsed_ms
     );
 
     if (line_len < 0 || line_len >= (int)sizeof(line)) {
@@ -770,6 +901,17 @@ void rf_survey_tick(void)
         (uint32_t)(now_ms - g_survey.current_window_started_at_ms);
 
     if (window_elapsed_ms >= g_survey.window_ms) {
+        for (uint8_t i = 0; i < RF_SURVEY_MAX_TARGETS; i++) {
+            rf_survey_target_t *target = &g_survey.targets[i];
+
+            if (!target->used) {
+                continue;
+            }
+
+            target->previous_window_score = target->last_reported_score;
+            target->has_previous_window_score = true;
+        }
+
         rf_survey_reset_all_target_windows();
         g_survey.current_window_started_at_ms = now_ms;
     }

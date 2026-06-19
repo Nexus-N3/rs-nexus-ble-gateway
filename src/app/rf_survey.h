@@ -21,6 +21,8 @@
 #define RF_SURVEY_FRESH_SCORE_MAX    10U
 #define RF_SURVEY_FRESH_SCORE_OK     5U
 
+#define RF_SURVEY_TREND_DELTA_MIN 10U
+
 // Define RF Survey states - what is the rf_survery current state?
 typedef enum {
     RF_SURVEY_STATE_INACTIVE = 0,
