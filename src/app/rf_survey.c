@@ -10,6 +10,7 @@
 #define RF_SURVEY_MAX_TARGETS GATEWAY_MAX_SENSORS
 #define RF_SURVEY_DEFAULT_WINDOW_MS 5000U
 #define RF_SURVEY_DEFAULT_DURATION_MS 60000U
+#define RF_SURVEY_JSON_LINE_MAX 768
 
 // what we want to track in the rf survey
 typedef struct {
@@ -58,6 +59,10 @@ typedef struct {
 } rf_survey_context_t;
 
 static rf_survey_context_t g_survey;
+static char g_rf_survey_status_line[RF_SURVEY_JSON_LINE_MAX];
+static char g_rf_survey_target_status_line[RF_SURVEY_JSON_LINE_MAX];
+static char g_rf_survey_target_final_line[RF_SURVEY_JSON_LINE_MAX];
+static char g_rf_survey_stop_line[RF_SURVEY_JSON_LINE_MAX];
 
 typedef struct {
     bool seen;
@@ -210,6 +215,23 @@ static void rf_survey_snapshot_target(
     snapshot->quality = rf_survey_quality_label(snapshot->score);
 }
 
+static int rf_survey_finish_json_line(
+    const char *line,
+    size_t line_capacity,
+    int line_len
+)
+{
+    if (line_len < 0) {
+        return -EIO;
+    }
+
+    if (line_len >= (int)line_capacity) {
+        return -EMSGSIZE;
+    }
+
+    return gateway_interface_send_json_line(line);
+}
+
 static const char *rf_survey_state_name(rf_survey_state_t state){
     // returns a pointer to a string literal
     switch(state){
@@ -241,6 +263,23 @@ static void rf_survey_reset_all_target_windows(void)
     for (uint8_t i = 0; i < g_survey.target_count; i++) {
         rf_survey_reset_target_window(&g_survey.targets[i]);
     }
+}
+
+static void rf_survey_complete_window(void)
+{
+    for (uint8_t i = 0; i < RF_SURVEY_MAX_TARGETS; i++) {
+        rf_survey_target_t *target = &g_survey.targets[i];
+
+        if (!target->used) {
+            continue;
+        }
+
+        target->previous_window_score = target->last_reported_score;
+        target->has_previous_window_score = true;
+    }
+
+    rf_survey_reset_all_target_windows();
+    g_survey.current_window_started_at_ms = k_uptime_get();
 }
 
 // returns a point to an rf_survey_target
@@ -415,12 +454,14 @@ static int rf_survey_send_target_status(
     int64_t now_ms
 )
 {
-    char line[512];
     int line_len;
     rf_survey_target_snapshot_t snapshot;
-
     const char *trend;
     uint32_t elapsed_ms = 0;
+
+    if (target == NULL || !target->used) {
+        return 0;
+    }
 
     rf_survey_snapshot_target(target, now_ms, &snapshot);
 
@@ -437,15 +478,9 @@ static int rf_survey_send_target_status(
     target->last_reported_score = snapshot.score;
     rf_survey_update_score_history(target, snapshot.score, elapsed_ms);
 
-    if (target == NULL || !target->used) {
-        return 0;
-    }
-
-    rf_survey_snapshot_target(target, now_ms, &snapshot);
-
     line_len = snprintf(
-        line,
-        sizeof(line),
+        g_rf_survey_target_status_line,
+        sizeof(g_rf_survey_target_status_line),
         "{\"type\":\"rf_survey_target_status\","
         "\"request_id\":\"%s\","
         "\"address\":\"%s\","
@@ -454,21 +489,10 @@ static int rf_survey_send_target_status(
         "\"rssi_avg\":%d,"
         "\"rssi_min\":%d,"
         "\"rssi_max\":%d,"
-        "\"observations_total\":%u,"
-        "\"rssi_avg_total\":%d,"
-        "\"rssi_min_total\":%d,"
-        "\"rssi_max_total\":%d,"
-        "\"first_seen_age_ms\":%u,"
         "\"last_seen_age_ms\":%u,"
         "\"score\":%u,"
         "\"quality\":\"%s\","
-        "\"trend\":\"%s\","
-        "\"best_score\":%u,"
-        "\"worst_score\":%u,"
-        "\"mean_score\":%u,"
-        "\"score_sample_count\":%u,"
-        "\"best_score_elapsed_ms\":%u,"
-        "\"worst_score_elapsed_ms\":%u}",
+        "\"trend\":\"%s\"}",
         request_id != NULL ? request_id : "",
         target->address,
         snapshot.seen ? "true" : "false",
@@ -476,28 +500,17 @@ static int rf_survey_send_target_status(
         (int)snapshot.avg_rssi,
         (int)target->min_rssi_current_window,
         (int)target->max_rssi_current_window,
-        (unsigned int)target->observations_total,
-        (int)snapshot.avg_rssi_total,
-        (int)target->min_rssi_total,
-        (int)target->max_rssi_total,
-        (unsigned int)snapshot.first_seen_age_ms,
         (unsigned int)snapshot.last_seen_age_ms,
         (unsigned int)snapshot.score,
         snapshot.quality,
-        trend,
-        (unsigned int)target->best_score,
-        (unsigned int)target->worst_score,
-        (unsigned int)rf_survey_mean_score(target),
-        (unsigned int)target->score_sample_count,
-        (unsigned int)target->best_score_elapsed_ms,
-        (unsigned int)target->worst_score_elapsed_ms
+        trend
     );
 
-    if (line_len < 0 || line_len >= (int)sizeof(line)) {
-        return -EMSGSIZE;
-    }
-
-    return gateway_interface_send_json_line(line);
+    return rf_survey_finish_json_line(
+        g_rf_survey_target_status_line,
+        sizeof(g_rf_survey_target_status_line),
+        line_len
+    );
 }
 
 static int rf_survey_send_target_final(
@@ -506,7 +519,6 @@ static int rf_survey_send_target_final(
     int64_t now_ms
 )
 {
-    char line[512];
     int line_len;
     rf_survey_target_snapshot_t snapshot;
     const char *trend;
@@ -524,8 +536,8 @@ static int rf_survey_send_target_final(
     );
 
     line_len = snprintf(
-        line,
-        sizeof(line),
+        g_rf_survey_target_final_line,
+        sizeof(g_rf_survey_target_final_line),
         "{\"type\":\"rf_survey_target_final\","
         "\"request_id\":\"%s\","
         "\"address\":\"%s\","
@@ -567,11 +579,11 @@ static int rf_survey_send_target_final(
         (unsigned int)target->worst_score_elapsed_ms
     );
 
-    if (line_len < 0 || line_len >= (int)sizeof(line)) {
-        return -EMSGSIZE;
-    }
-
-    return gateway_interface_send_json_line(line);
+    return rf_survey_finish_json_line(
+        g_rf_survey_target_final_line,
+        sizeof(g_rf_survey_target_final_line),
+        line_len
+    );
 }
 
 // end of private helpers section
@@ -586,6 +598,12 @@ void rf_survey_init(void){
 bool rf_survey_is_active(void){
     // checks if the survey is active? returns true or false
     return g_survey.state == RF_SURVEY_STATE_ACTIVE;
+}
+
+static bool rf_survey_has_status_data(void)
+{
+    return g_survey.state == RF_SURVEY_STATE_ACTIVE ||
+           g_survey.state == RF_SURVEY_STATE_STOPPING;
 }
 
 rf_survey_state_t rf_survey_get_state(void){
@@ -683,7 +701,6 @@ int rf_survey_start(
 }
 
 int rf_survey_stop(const char *request_id){
-    char line[256];
     int64_t now_ms;
     uint32_t elapsed_ms = 0;
     int line_len;
@@ -706,8 +723,8 @@ int rf_survey_stop(const char *request_id){
     }
 
     line_len = snprintf(
-        line,
-        sizeof(line),
+        g_rf_survey_stop_line,
+        sizeof(g_rf_survey_stop_line),
         "{\"type\":\"rf_survey_stopped\","
         "\"request_id\":\"%s\","
         "\"ok\":true,"
@@ -720,12 +737,11 @@ int rf_survey_stop(const char *request_id){
         (unsigned int)elapsed_ms
     );
 
-    if (line_len < 0 || line_len >= (int)sizeof(line)) {
-        rc = -EMSGSIZE;
-        goto clear_and_return;
-    }
-
-    rc = gateway_interface_send_json_line(line);
+    rc = rf_survey_finish_json_line(
+        g_rf_survey_stop_line,
+        sizeof(g_rf_survey_stop_line),
+        line_len
+    );
     if (rc != 0) {
         goto clear_and_return;
     }
@@ -742,8 +758,8 @@ int rf_survey_stop(const char *request_id){
     }
 
     line_len = snprintf(
-        line,
-        sizeof(line),
+        g_rf_survey_stop_line,
+        sizeof(g_rf_survey_stop_line),
         "{\"type\":\"rf_survey_stop_complete\","
         "\"request_id\":\"%s\","
         "\"target_count\":%u}",
@@ -751,12 +767,11 @@ int rf_survey_stop(const char *request_id){
         (unsigned int)g_survey.target_count
     );
 
-    if (line_len < 0 || line_len >= (int)sizeof(line)) {
-        rc = -EMSGSIZE;
-        goto clear_and_return;
-    }
-
-    rc = gateway_interface_send_json_line(line);
+    rc = rf_survey_finish_json_line(
+        g_rf_survey_stop_line,
+        sizeof(g_rf_survey_stop_line),
+        line_len
+    );
 
 clear_and_return:
     memset(&g_survey, 0, sizeof(g_survey));
@@ -767,27 +782,29 @@ clear_and_return:
 
 int rf_survey_send_status(const char *request_id)
 {
-    char line[256];
     int64_t now_ms = k_uptime_get();
     uint32_t elapsed_ms = 0;
     uint32_t window_elapsed_ms = 0;
 
-    if (g_survey.state == RF_SURVEY_STATE_ACTIVE &&
+    if (rf_survey_has_status_data() &&
         g_survey.started_at_ms > 0 &&
         now_ms >= g_survey.started_at_ms) {
         elapsed_ms = (uint32_t)(now_ms - g_survey.started_at_ms);
     }
 
-    if (g_survey.state == RF_SURVEY_STATE_ACTIVE &&
+    if (rf_survey_has_status_data() &&
         g_survey.current_window_started_at_ms > 0 &&
         now_ms >= g_survey.current_window_started_at_ms) {
         window_elapsed_ms =
             (uint32_t)(now_ms - g_survey.current_window_started_at_ms);
     }
 
-    snprintf(
-        line,
-        sizeof(line),
+    int rc;
+    int line_len;
+
+    line_len = snprintf(
+        g_rf_survey_status_line,
+        sizeof(g_rf_survey_status_line),
         "{\"type\":\"rf_survey_status\","
         "\"request_id\":\"%s\","
         "\"active\":%s,"
@@ -807,9 +824,11 @@ int rf_survey_send_status(const char *request_id)
         (unsigned int)g_survey.target_count
     );
 
-    int rc;
-
-    rc = gateway_interface_send_json_line(line);
+    rc = rf_survey_finish_json_line(
+        g_rf_survey_status_line,
+        sizeof(g_rf_survey_status_line),
+        line_len
+    );
     if (rc != 0) {
         return rc;
     }
@@ -826,9 +845,9 @@ int rf_survey_send_status(const char *request_id)
         }
     }
 
-    snprintf(
-        line,
-        sizeof(line),
+    line_len = snprintf(
+        g_rf_survey_status_line,
+        sizeof(g_rf_survey_status_line),
         "{\"type\":\"rf_survey_status_complete\","
         "\"request_id\":\"%s\","
         "\"target_count\":%u}",
@@ -836,7 +855,11 @@ int rf_survey_send_status(const char *request_id)
         (unsigned int)g_survey.target_count
     );
 
-    return gateway_interface_send_json_line(line);
+    return rf_survey_finish_json_line(
+        g_rf_survey_status_line,
+        sizeof(g_rf_survey_status_line),
+        line_len
+    );
 }
 
 void rf_survey_on_sensor_found(const ble_discovered_sensor_t *sensor)
@@ -866,8 +889,10 @@ void rf_survey_on_sensor_found(const ble_discovered_sensor_t *sensor)
 void rf_survey_tick(void)
 {
     int64_t now_ms;
-    uint32_t elapsed_ms;
-    uint32_t window_elapsed_ms;
+    uint32_t elapsed_ms = 0;
+    uint32_t window_elapsed_ms = 0;
+    bool should_complete_window = false;
+    bool reached_duration = false;
 
     if (g_survey.state != RF_SURVEY_STATE_ACTIVE) {
         return;
@@ -875,44 +900,36 @@ void rf_survey_tick(void)
 
     now_ms = k_uptime_get();
 
-    if (g_survey.duration_ms > 0) {
+    if (g_survey.started_at_ms > 0 && now_ms >= g_survey.started_at_ms) {
         elapsed_ms = (uint32_t)(now_ms - g_survey.started_at_ms);
+    }
 
-        if (elapsed_ms >= g_survey.duration_ms) {
-            g_survey.state = RF_SURVEY_STATE_STOPPING;
+    if (g_survey.current_window_started_at_ms > 0 &&
+        now_ms >= g_survey.current_window_started_at_ms) {
+        window_elapsed_ms =
+            (uint32_t)(now_ms - g_survey.current_window_started_at_ms);
+    }
 
-            /*
-             * For this first version, do not emit JSON here.
-             * The scan scheduler may also timeout and send scan_complete.
-             * We can decide later whether duration expiry should emit
-             * rf_survey_stopped automatically.
-             */
-            memset(&g_survey, 0, sizeof(g_survey));
-            g_survey.state = RF_SURVEY_STATE_INACTIVE;
-            return;
+    if (g_survey.window_ms > 0 && window_elapsed_ms >= g_survey.window_ms) {
+        should_complete_window = true;
+    }
+
+    if (g_survey.duration_ms > 0 && elapsed_ms >= g_survey.duration_ms) {
+        reached_duration = true;
+    }
+
+    if (should_complete_window && reached_duration) {
+        g_survey.state = RF_SURVEY_STATE_STOPPING;
+    }
+
+    if (should_complete_window) {
+        (void)rf_survey_send_status(NULL);
+        if (!reached_duration) {
+            rf_survey_complete_window();
         }
     }
 
-    if (g_survey.window_ms == 0) {
-        return;
-    }
-
-    window_elapsed_ms =
-        (uint32_t)(now_ms - g_survey.current_window_started_at_ms);
-
-    if (window_elapsed_ms >= g_survey.window_ms) {
-        for (uint8_t i = 0; i < RF_SURVEY_MAX_TARGETS; i++) {
-            rf_survey_target_t *target = &g_survey.targets[i];
-
-            if (!target->used) {
-                continue;
-            }
-
-            target->previous_window_score = target->last_reported_score;
-            target->has_previous_window_score = true;
-        }
-
-        rf_survey_reset_all_target_windows();
-        g_survey.current_window_started_at_ms = now_ms;
+    if (reached_duration) {
+        g_survey.state = RF_SURVEY_STATE_STOPPING;
     }
 }
