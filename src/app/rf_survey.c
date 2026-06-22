@@ -279,7 +279,7 @@ static void rf_survey_complete_window(void)
     }
 
     rf_survey_reset_all_target_windows();
-    g_survey.current_window_started_at_ms = k_uptime_get();
+    g_survey.current_window_started_at_ms += g_survey.window_ms;
 }
 
 // returns a point to an rf_survey_target
@@ -393,7 +393,7 @@ static const char *rf_survey_trend_label(
 )
 {
     if (!has_previous_score) {
-        return "unknown";
+        return "not_yet_computed";
     }
 
     if (current_score >= previous_score + RF_SURVEY_TREND_DELTA_MIN) {
@@ -893,6 +893,7 @@ void rf_survey_tick(void)
     uint32_t window_elapsed_ms = 0;
     bool should_complete_window = false;
     bool reached_duration = false;
+    bool should_emit_final_status = false;
 
     if (g_survey.state != RF_SURVEY_STATE_ACTIVE) {
         return;
@@ -918,6 +919,10 @@ void rf_survey_tick(void)
         reached_duration = true;
     }
 
+    if (reached_duration && !should_complete_window) {
+        should_emit_final_status = true;
+    }
+
     if (should_complete_window && reached_duration) {
         g_survey.state = RF_SURVEY_STATE_STOPPING;
     }
@@ -927,6 +932,11 @@ void rf_survey_tick(void)
         if (!reached_duration) {
             rf_survey_complete_window();
         }
+    }
+
+    if (should_emit_final_status) {
+        g_survey.state = RF_SURVEY_STATE_STOPPING;
+        (void)rf_survey_send_status(NULL);
     }
 
     if (reached_duration) {

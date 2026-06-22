@@ -460,6 +460,8 @@ int ble_scheduler_init(void)
 
 int ble_scheduler_start_rf_survey_scan(const char *request_id, uint32_t timeout_ms)
 {
+    ARG_UNUSED(request_id);
+
     g_state = SCHEDULER_STATE_DISCOVERING;
 
     if (timeout_ms == 0) {
@@ -467,14 +469,6 @@ int ble_scheduler_start_rf_survey_scan(const char *request_id, uint32_t timeout_
     }
 
     memset(g_scan_request_id, 0, sizeof(g_scan_request_id));
-
-    if (request_id != NULL) {
-        strncpy(
-            g_scan_request_id,
-            request_id,
-            sizeof(g_scan_request_id) - 1
-        );
-    }
 
     g_scan_deadline_ms = k_uptime_get() + timeout_ms;
     g_scan_active = true;
@@ -518,7 +512,9 @@ int ble_scheduler_stop_scan(void)
     if (g_scan_active) {
         g_scan_active = false;
         g_state = SCHEDULER_STATE_IDLE;
-        gateway_interface_send_scan_complete(g_scan_request_id);
+        if (g_scan_request_id[0] != '\0') {
+            gateway_interface_send_scan_complete(g_scan_request_id);
+        }
     }
 
     return rc;
@@ -1160,6 +1156,10 @@ void ble_scheduler_report_notification_rx_stats(const char *request_id)
 void ble_scheduler_on_sensor_found(const ble_discovered_sensor_t *found)
 {
     if (found == NULL) {
+        return;
+    }
+
+    if (g_scan_request_id[0] == '\0') {
         return;
     }
 
