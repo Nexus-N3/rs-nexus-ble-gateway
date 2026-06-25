@@ -3,8 +3,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-//#include "../ble/ble_types.h"
-#include "../config/gateway_config.h"  //isnt this what config is for instead of reaching into ble types?
+#include "../ble/ble_types.h"
+//#include "../config/gateway_config.h"  //isnt this what config is for instead of reaching into ble types?
 
 // commands that the gateway accepts from the host
 typedef enum {
