@@ -44,8 +44,8 @@ int rf_survey_start(
 );
 
 int rf_survey_stop(const char *request_id);
-int rf_survey_send_status(const char *request_id);
 
+int rf_survey_send_status(const char *request_id);
 bool rf_survey_is_active(void);
 rf_survey_state_t rf_survey_get_state(void);
 

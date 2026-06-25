@@ -25,7 +25,6 @@ typedef enum {
     GW_CMD_RF_SURVEY_START,
     GW_CMD_RF_SURVEY_STATUS,
     GW_CMD_RF_SURVEY_STOP,
-    GW_CMD_RF_SURVEY_MARK,  // A command sent to mark an active survey
 } gateway_command_type_t;
 
 //events that the gateway emits
