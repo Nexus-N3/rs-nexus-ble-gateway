@@ -4,7 +4,7 @@
 #include "../ble/ble_interface.h"
 #include "../ble/ble_scheduler.h"
 #include "../hardware/led.h"
-
+#include "../hardware/button.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -18,7 +18,58 @@ static const char *request_id_or_null(const gateway_command_t *command)
     return command->request_id;
 }
 
+// button press callback 
+static void on_gateway_button_event(
+    button_event_t event,
+    int64_t timestamp_ms
+)
+{
+    /*
+        when we want to route this event to a command path
+        gateway_command_t command = {0} //clear out command 
+        ARG_UNUSED(timestamp_ms); //not used so state it
 
+        if (event != BUTTON_EVENT_PRESSED) {
+            return;
+        }
+        // if the survey is not active return something
+        if(!rf_survey_is_active()){
+            
+        }
+
+        command.type = GW_CMD_RF_SURVEY_MARK;
+        command.source = GW_COMMAND_SOURCE_BUTTON;
+
+        call on gateway command with the address of the new command (once the callback is done the command memory is reusable)
+        on_gateway_command(&command);
+
+    */
+
+    char line[128];
+    int line_len;
+
+    if (event != BUTTON_EVENT_PRESSED) {
+        return;
+    }
+
+    line_len = snprintf(
+        line,
+        sizeof(line),
+        "{\"type\":\"button_pressed\","
+        "\"source\":\"gateway\","
+        "\"timestamp_ms\":%lld}",
+        (long long)timestamp_ms
+    );
+
+    if (line_len < 0 || line_len >= (int)sizeof(line)) {
+        return;
+    }
+
+    // tmp ack of the button press for testing with
+    gateway_interface_send_json_line(line);
+}
+
+// gateway command callback from the gateway interface
 static void on_gateway_command(const gateway_command_t *command)
 {
     if (command == NULL) {
@@ -315,6 +366,7 @@ static void on_ble_notification(
 
 int gateway_app_init(void)
 {
+    int rc;
     gateway_interface_callbacks_t interface_callbacks = {
         .on_command = on_gateway_command,
     };
@@ -326,7 +378,7 @@ int gateway_app_init(void)
         .on_notification = on_ble_notification,
     };
 
-    int rc = gateway_interface_init(&interface_callbacks);
+    rc = gateway_interface_init(&interface_callbacks);
     if (rc != 0) {
         return rc;
     }
@@ -337,8 +389,15 @@ int gateway_app_init(void)
         return rc;
     }
 
+
     ble_scheduler_init();
     rf_survey_init(); // new rf survey module
+
+     //init the button after everything else
+    rc = button_init(on_gateway_button_event);
+    if (rc != 0) {
+        gateway_interface_send_error(NULL, "button_init_failed", rc);
+    }
 
     gateway_interface_send_ready();
 

@@ -3,8 +3,10 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include "../ble/ble_types.h"
+//#include "../ble/ble_types.h"
+#include "../config/gateway_config.h"  //isnt this what config is for instead of reaching into ble types?
 
+// commands that the gateway accepts from the host
 typedef enum {
     GW_CMD_NONE = 0,
     GW_CMD_HELLO,
@@ -23,8 +25,12 @@ typedef enum {
     GW_CMD_RF_SURVEY_START,
     GW_CMD_RF_SURVEY_STATUS,
     GW_CMD_RF_SURVEY_STOP,
+    GW_CMD_RF_SURVEY_MARK,  // A command sent to mark an active survey
 } gateway_command_type_t;
 
+//events that the gateway emits
+//not every event goes through here for example send hello or scan result
+//these events are more high level and simple.
 typedef enum {
     GW_EVT_READY = 0,
     GW_EVT_SCAN_RESULT,
@@ -46,6 +52,7 @@ typedef enum {
     GW_EVT_SESSION_FAILED,
 } gateway_event_type_t;
 
+// data structure definitions 
 typedef struct {
     char address[GATEWAY_MAX_ADDRESS_LEN];
     char sensor_key[GATEWAY_MAX_SENSOR_KEY_LEN];
