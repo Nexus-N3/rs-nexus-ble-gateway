@@ -1222,7 +1222,7 @@ static uint8_t notify_cb(
     return BT_GATT_ITER_CONTINUE;
 }
 
-int ble_interface_subscribe(const char *address, const char *characteristic_uuid)
+int ble_interface_subscribe(const char *address, const char *characteristic_uuid, bool indicate)
 {
     active_conn_t *entry;
     gatt_subscribe_ctx_t *ctx;
@@ -1304,7 +1304,9 @@ int ble_interface_subscribe(const char *address, const char *characteristic_uuid
     memset(&ctx->params, 0, sizeof(ctx->params));
 
     ctx->params.notify = notify_cb;
-    ctx->params.value = BT_GATT_CCC_NOTIFY;
+    ctx->params.value = indicate
+        ? BT_GATT_CCC_INDICATE
+        : BT_GATT_CCC_NOTIFY;
     ctx->params.value_handle = value_handle;
     ctx->params.ccc_handle = ccc_handle;
 

@@ -94,7 +94,8 @@ static void on_gateway_command(const gateway_command_t *command)
             request_id_or_null(command),
             command->address,
             command->characteristic_uuid,
-            command->binary_notifications
+            command->binary_notifications,
+            command->indicate
         );
 
         if (rc != 0) {

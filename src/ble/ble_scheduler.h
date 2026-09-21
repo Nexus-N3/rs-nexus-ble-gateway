@@ -47,7 +47,8 @@ int ble_scheduler_subscribe(
     const char *request_id,
     const char *address,
     const char *characteristic_uuid,
-    bool binary_notifications
+    bool binary_notifications,
+    bool indicate
 );
 int ble_scheduler_unsubscribe(
     const char *address,

@@ -61,6 +61,7 @@ typedef struct {
     char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
     bool without_response;
     bool binary_notifications;
+    bool indicate;
     uint16_t payload_len;
     uint8_t payload[GATEWAY_MAX_FRAME_PAYLOAD];
 } pending_gatt_op_t;
@@ -581,11 +582,16 @@ int ble_scheduler_subscribe(
         const char *request_id,
         const char *address,
         const char *characteristic_uuid,
-        bool binary_notifications
+        bool binary_notifications,
+        bool indicate
 )
 {
     if (address == NULL || characteristic_uuid == NULL) {
         return -1;
+    }
+
+    if (indicate && binary_notifications) {
+        return -22;
     }
 
     if (g_pending_gatt_op.pending) {
@@ -597,6 +603,7 @@ int ble_scheduler_subscribe(
     g_pending_gatt_op.pending = true;
     g_pending_gatt_op.type = GATT_OP_SUBSCRIBE;
     g_pending_gatt_op.binary_notifications = binary_notifications;
+    g_pending_gatt_op.indicate = indicate;
 
     strncpy(
         g_pending_gatt_op.address,
@@ -969,7 +976,8 @@ void ble_scheduler_tick(void)
         uint8_t sensor_id = 0U;
         int rc = ble_interface_subscribe(
             g_pending_gatt_op.address,
-            g_pending_gatt_op.characteristic_uuid
+            g_pending_gatt_op.characteristic_uuid,
+            g_pending_gatt_op.indicate
         );
 
         if (rc != 0) {

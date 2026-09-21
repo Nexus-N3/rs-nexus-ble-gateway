@@ -725,6 +725,13 @@ static void parse_command_line(const char *line, gateway_command_t *command)
             "binary_notifications",
             false
         );
+
+        command->indicate = extract_bool_field(
+            line,
+            "indicate",
+            false
+        );
+        
         return;
     }
 

@@ -54,6 +54,7 @@ typedef struct {
     uint32_t timeout_ms;
     bool without_response;
     bool binary_notifications;
+    bool indicate;
     char address[GATEWAY_MAX_ADDRESS_LEN];
     char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
     uint8_t payload[GATEWAY_MAX_FRAME_PAYLOAD];

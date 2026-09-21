@@ -34,7 +34,7 @@ int ble_interface_disconnect_all(void);
 int ble_interface_reset_state(void);
 
 int ble_interface_discover_gatt(const char *address);
-int ble_interface_subscribe(const char *address, const char *characteristic_uuid);
+int ble_interface_subscribe(const char *address, const char *characteristic_uuid, bool indicate);
 int ble_interface_read(
     const char *address,
     const char *characteristic_uuid,
