@@ -68,7 +68,7 @@ int ble_scheduler_gatt_read(
     const char *characteristic_uuid
 );
 int ble_scheduler_disconnect_all(void);
-int ble_scheduler_reset_session(void);
+int ble_scheduler_reset_session(const char *request_id);
 int ble_scheduler_get_status(void);
 
 void ble_scheduler_tick(void);
@@ -84,6 +84,7 @@ void ble_scheduler_on_notification(
     const char *characteristic_uuid,
     const uint8_t *payload,
     size_t payload_len,
-    uint64_t gateway_time_us
+    uint64_t gateway_time_us,
+    uint32_t receive_sequence
 );
 void ble_scheduler_report_notification_rx_stats(const char *request_id);

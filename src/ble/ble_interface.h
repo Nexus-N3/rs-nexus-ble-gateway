@@ -13,7 +13,8 @@ typedef void (*ble_notification_cb_t)(
     const char *characteristic_uuid,
     const uint8_t *payload,
     size_t payload_len,
-    uint64_t gateway_time_us
+    uint64_t gateway_time_us,
+    uint32_t receive_sequence
 );
 
 typedef struct {
@@ -48,6 +49,17 @@ int ble_interface_write(
     size_t data_len,
     bool without_response
 );
+
+/*
+ * Writes with response are asynchronous. ble_interface_write() accepts and
+ * submits (or starts handle discovery for) the operation, while this function
+ * advances timeout/cancellation handling and reports completion from main-loop
+ * context. It returns 1 when a result was consumed, 0 while pending, or a
+ * negative errno for invalid arguments.
+ */
+int ble_interface_write_poll(int *result_out);
+bool ble_interface_write_is_busy(void);
+void ble_interface_write_cancel(int reason);
 
 int ble_interface_get_rssi(const char *address, int8_t *rssi_out);
 uint8_t ble_interface_active_connection_count(void);

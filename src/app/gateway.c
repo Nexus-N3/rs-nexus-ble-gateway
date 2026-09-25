@@ -183,18 +183,20 @@ static void on_gateway_command(const gateway_command_t *command)
         break;
     }
 
-    case GW_CMD_DISCONNECT_ALL:
-        if (ble_scheduler_disconnect_all() != 0) {
+    case GW_CMD_DISCONNECT_ALL: {
+        int rc = ble_scheduler_disconnect_all();
+        if (rc != 0) {
             gateway_interface_send_error(
                 request_id_or_null(command),
                 "disconnect_all_failed",
-                -1
+                rc
             );
         }
         break;
+    }
 
     case GW_CMD_RESET_SESSION: {
-        int rc = ble_scheduler_reset_session();
+        int rc = ble_scheduler_reset_session(request_id_or_null(command));
 
         if (rc != 0) {
             gateway_interface_send_error(
@@ -202,17 +204,6 @@ static void on_gateway_command(const gateway_command_t *command)
                 "reset_session_failed",
                 rc
             );
-        } else {
-            char line[128];
-            snprintf(
-                line,
-                sizeof(line),
-                "{\"type\":\"reset_session_complete\","
-                "\"request_id\":\"%s\","
-                "\"ok\":true}",
-                command->request_id
-            );
-            gateway_interface_send_json_line(line);
         }
         break;
     }
@@ -250,10 +241,18 @@ static void on_ble_notification(
     const char *characteristic_uuid,
     const uint8_t *payload,
     size_t payload_len,
-    uint64_t gateway_time_us
+    uint64_t gateway_time_us,
+    uint32_t receive_sequence
 )
 {
-    ble_scheduler_on_notification(address, characteristic_uuid, payload, payload_len, gateway_time_us);
+    ble_scheduler_on_notification(
+        address,
+        characteristic_uuid,
+        payload,
+        payload_len,
+        gateway_time_us,
+        receive_sequence
+    );
 }
 
 int gateway_app_init(void)

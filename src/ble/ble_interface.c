@@ -1,4 +1,5 @@
 #include "ble_interface.h"
+#include "gatt_write_state.h"
 #include "../interface/gateway_interface.h"
 
 #include <zephyr/bluetooth/bluetooth.h>
@@ -7,6 +8,7 @@
 #include <zephyr/bluetooth/addr.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 
 #include <errno.h>
 #include <stdio.h>
@@ -26,6 +28,7 @@
 #define BLE_CONN_LATENCY 0
 #define BLE_CONN_SUPERVISION_TIMEOUT_UNITS 400 /* 4 s */
 #define GATT_HANDLE_CACHE_SIZE (GATEWAY_MAX_SENSORS * 4)
+#define GATT_WRITE_TIMEOUT_MS 4000
 
 
 static const struct bt_le_conn_param g_ble_conn_param = {
@@ -49,9 +52,23 @@ typedef struct {
 } gatt_discover_ctx_t;
 
 typedef struct {
+    atomic_t state;
+    struct bt_gatt_discover_params discover_params;
+    struct bt_uuid_any uuid;
     struct bt_gatt_write_params params;
-    struct k_sem done;
-    int err;
+    struct bt_conn *conn;
+    char address[GATEWAY_MAX_ADDRESS_LEN];
+    char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
+    uint8_t payload[GATEWAY_MAX_FRAME_PAYLOAD];
+    size_t payload_len;
+    uint16_t value_handle;
+    uint16_t mtu;
+    int64_t deadline_ms;
+    int result;
+    int cancel_reason;
+    bool callback_seen;
+    bool cancellation_requested;
+    bool without_response;
 } gatt_write_ctx_t;
 
 typedef struct {
@@ -105,6 +122,7 @@ static gatt_write_ctx_t g_write_ctx;
 static gatt_read_ctx_t g_read_ctx;
 static gatt_subscribe_ctx_t g_subscribe_ctxs[GATEWAY_MAX_SENSORS];
 static gatt_handle_cache_t g_handle_cache[GATT_HANDLE_CACHE_SIZE];
+static atomic_t g_notification_receive_sequence;
 
 #if GATEWAY_ENABLE_GATT_DEBUG
 static void emit_gatt_debug(
@@ -527,17 +545,59 @@ static uint8_t discover_ccc_cb(
     return BT_GATT_ITER_CONTINUE;
 }
 
+static uint8_t write_discover_cb(
+    struct bt_conn *conn,
+    const struct bt_gatt_attr *attr,
+    struct bt_gatt_discover_params *params
+)
+{
+    gatt_write_ctx_t *ctx =
+        CONTAINER_OF(params, gatt_write_ctx_t, discover_params);
+
+    ARG_UNUSED(conn);
+
+    if (atomic_get(&ctx->state) == GATT_WRITE_CANCELLING) {
+        ctx->callback_seen = true;
+        ctx->result = ctx->cancel_reason;
+        atomic_set(&ctx->state, GATT_WRITE_COMPLETE);
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (attr == NULL) {
+        ctx->callback_seen = true;
+        ctx->result = -ENOENT;
+        atomic_set(&ctx->state, GATT_WRITE_COMPLETE);
+        return BT_GATT_ITER_STOP;
+    }
+
+    const struct bt_gatt_chrc *chrc =
+        (const struct bt_gatt_chrc *)attr->user_data;
+
+    if (chrc != NULL) {
+        ctx->value_handle = chrc->value_handle;
+        atomic_set(&ctx->state, GATT_WRITE_HANDLE_READY);
+        return BT_GATT_ITER_STOP;
+    }
+
+    return BT_GATT_ITER_CONTINUE;
+}
+
 static void write_complete_cb(
     struct bt_conn *conn,
     uint8_t err,
     struct bt_gatt_write_params *params
 )
 {
-    ARG_UNUSED(conn);
-    ARG_UNUSED(params);
+    gatt_write_ctx_t *ctx =
+        CONTAINER_OF(params, gatt_write_ctx_t, params);
 
-    g_write_ctx.err = err == 0 ? 0 : -(int)err;
-    k_sem_give(&g_write_ctx.done);
+    ARG_UNUSED(conn);
+
+    ctx->callback_seen = true;
+    ctx->result = ctx->cancellation_requested
+        ? ctx->cancel_reason
+        : (err == 0 ? 0 : -(int)err);
+    atomic_set(&ctx->state, GATT_WRITE_COMPLETE);
 }
 
 static uint8_t read_complete_cb(
@@ -950,6 +1010,29 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 
     format_address(bt_conn_get_dst(conn), address, sizeof(address));
 
+    if (g_write_ctx.conn == conn && ble_interface_write_is_busy()) {
+        g_write_ctx.cancellation_requested = true;
+
+        if (g_write_ctx.cancel_reason == 0) {
+            g_write_ctx.cancel_reason = -ECONNRESET;
+        }
+
+        g_write_ctx.result = g_write_ctx.cancel_reason;
+
+        emit_gatt_debug(
+            "write_completed_on_disconnect",
+            g_write_ctx.address,
+            g_write_ctx.characteristic_uuid,
+            g_write_ctx.value_handle,
+            g_write_ctx.mtu,
+            g_write_ctx.payload_len,
+            g_write_ctx.result,
+            false
+        );
+
+        atomic_set(&g_write_ctx.state, GATT_WRITE_COMPLETE);
+    }
+
     if (entry != NULL) {
         release_subscribe_ctxs_for_address(address);
         release_active_conn(entry);
@@ -1143,12 +1226,20 @@ int ble_interface_disconnect(const char *address)
         return -3;
     }
 
+    if (g_write_ctx.conn == entry->conn && ble_interface_write_is_busy()) {
+        ble_interface_write_cancel(-ECONNRESET);
+    }
+
     return bt_conn_disconnect(entry->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 }
 
 int ble_interface_disconnect_all(void)
 {
     int first_rc = 0;
+
+    if (ble_interface_write_is_busy()) {
+        ble_interface_write_cancel(-ECANCELED);
+    }
 
     for (size_t i = 0; i < ARRAY_SIZE(g_active_conns); i++) {
         if (!g_active_conns[i].used || g_active_conns[i].conn == NULL) {
@@ -1170,12 +1261,28 @@ int ble_interface_disconnect_all(void)
 
 int ble_interface_reset_state(void)
 {
+    if (ble_interface_write_is_busy()) {
+        ble_interface_write_cancel(-ECANCELED);
+        emit_gatt_debug(
+            "write_reset_deferred",
+            g_write_ctx.address,
+            g_write_ctx.characteristic_uuid,
+            g_write_ctx.value_handle,
+            g_write_ctx.mtu,
+            g_write_ctx.payload_len,
+            -EBUSY,
+            false
+        );
+        return -EBUSY;
+    }
+
     memset(g_known_peers, 0, sizeof(g_known_peers));
     memset(g_subscribe_ctxs, 0, sizeof(g_subscribe_ctxs));
     memset(&g_discover_ctx, 0, sizeof(g_discover_ctx));
     memset(&g_write_ctx, 0, sizeof(g_write_ctx));
     memset(&g_read_ctx, 0, sizeof(g_read_ctx));
     memset(g_handle_cache, 0, sizeof(g_handle_cache));
+    atomic_set(&g_notification_receive_sequence, 0);
     g_scanning = false;
     return 0;
 }
@@ -1201,6 +1308,7 @@ static uint8_t notify_cb(
 {
     gatt_subscribe_ctx_t *ctx =
         CONTAINER_OF(params, gatt_subscribe_ctx_t, params);
+    uint32_t receive_sequence;
 
     ARG_UNUSED(conn);
 
@@ -1209,13 +1317,18 @@ static uint8_t notify_cb(
         return BT_GATT_ITER_STOP;
     }
 
+    receive_sequence = (uint32_t)atomic_inc(
+        &g_notification_receive_sequence
+    ) + 1U;
+
     if (g_callbacks.on_notification != NULL) {
         g_callbacks.on_notification(
             ctx->address,
             ctx->characteristic_uuid,
             data,
             length,
-            k_ticks_to_us_floor64(k_uptime_ticks())
+            k_ticks_to_us_floor64(k_uptime_ticks()),
+            receive_sequence
         );
     }
 
@@ -1445,6 +1558,72 @@ int ble_interface_read(
     return g_read_ctx.err;
 }
 
+static int submit_gatt_write(void)
+{
+    int rc;
+
+    if (g_write_ctx.without_response) {
+        rc = bt_gatt_write_without_response(
+            g_write_ctx.conn,
+            g_write_ctx.value_handle,
+            g_write_ctx.payload,
+            (uint16_t)g_write_ctx.payload_len,
+            false
+        );
+        g_write_ctx.result = rc;
+        atomic_set(&g_write_ctx.state, GATT_WRITE_COMPLETE);
+        emit_gatt_debug(
+            rc == 0 ? "write_submitted" : "write_submit_failed",
+            g_write_ctx.address,
+            g_write_ctx.characteristic_uuid,
+            g_write_ctx.value_handle,
+            g_write_ctx.mtu,
+            g_write_ctx.payload_len,
+            rc,
+            true
+        );
+        return rc;
+    }
+
+    memset(&g_write_ctx.params, 0, sizeof(g_write_ctx.params));
+    g_write_ctx.params.handle = g_write_ctx.value_handle;
+    g_write_ctx.params.offset = 0;
+    g_write_ctx.params.data = g_write_ctx.payload;
+    g_write_ctx.params.length = (uint16_t)g_write_ctx.payload_len;
+    g_write_ctx.params.func = write_complete_cb;
+
+    atomic_set(&g_write_ctx.state, GATT_WRITE_ACTIVE);
+    rc = bt_gatt_write(g_write_ctx.conn, &g_write_ctx.params);
+
+    if (rc != 0) {
+        g_write_ctx.result = rc;
+        atomic_set(&g_write_ctx.state, GATT_WRITE_COMPLETE);
+        emit_gatt_debug(
+            "write_submit_failed",
+            g_write_ctx.address,
+            g_write_ctx.characteristic_uuid,
+            g_write_ctx.value_handle,
+            g_write_ctx.mtu,
+            g_write_ctx.payload_len,
+            rc,
+            false
+        );
+        return rc;
+    }
+
+    emit_gatt_debug(
+        "write_submitted",
+        g_write_ctx.address,
+        g_write_ctx.characteristic_uuid,
+        g_write_ctx.value_handle,
+        g_write_ctx.mtu,
+        g_write_ctx.payload_len,
+        0,
+        false
+    );
+    return 0;
+}
+
 int ble_interface_write(
     const char *address,
     const char *characteristic_uuid,
@@ -1454,123 +1633,201 @@ int ble_interface_write(
 )
 {
     active_conn_t *entry;
-    uint16_t handle;
+    uint16_t handle = 0;
     int rc;
 
     if (address == NULL || characteristic_uuid == NULL || data == NULL ||
         data_len == 0) {
-        return -1;
+        return -EINVAL;
+    }
+
+    if (data_len > GATEWAY_MAX_FRAME_PAYLOAD) {
+        return -EMSGSIZE;
+    }
+
+    if (ble_interface_write_is_busy()) {
+        emit_gatt_debug(
+            "write_busy", address, characteristic_uuid, 0, 0, data_len,
+            -EBUSY, without_response
+        );
+        return -EBUSY;
     }
 
     entry = find_active_conn_by_address(address);
     if (entry == NULL || entry->conn == NULL) {
-        return -3;
-    }
-
-    if (!get_cached_value_handle(address, characteristic_uuid, &handle)) {
-        rc = discover_characteristic_handle(
-            entry->conn,
-            characteristic_uuid,
-            &handle
-        );
-
-        if (rc != 0) {
-            emit_gatt_debug(
-                "write_discover_failed",
-                address,
-                characteristic_uuid,
-                0,
-                bt_gatt_get_mtu(entry->conn),
-                data_len,
-                rc,
-                without_response
-            );
-            return rc;
-        }
-
-        put_cached_value_handle(address, characteristic_uuid, handle);
-    }
-
-    emit_gatt_debug(
-        "write_start",
-        address,
-        characteristic_uuid,
-        handle,
-        bt_gatt_get_mtu(entry->conn),
-        data_len,
-        0,
-        without_response
-    );
-
-    if (without_response) {
-        rc = bt_gatt_write_without_response(
-            entry->conn,
-            handle,
-            data,
-            (uint16_t)data_len,
-            false
-        );
-        emit_gatt_debug(
-            "write_complete",
-            address,
-            characteristic_uuid,
-            handle,
-            bt_gatt_get_mtu(entry->conn),
-            data_len,
-            rc,
-            true
-        );
-        return rc;
+        return -ENOTCONN;
     }
 
     memset(&g_write_ctx, 0, sizeof(g_write_ctx));
-    k_sem_init(&g_write_ctx.done, 0, 1);
-    g_write_ctx.params.handle = handle;
-    g_write_ctx.params.offset = 0;
-    g_write_ctx.params.data = data;
-    g_write_ctx.params.length = (uint16_t)data_len;
-    g_write_ctx.params.func = write_complete_cb;
+    strncpy(g_write_ctx.address, address, sizeof(g_write_ctx.address) - 1);
+    strncpy(
+        g_write_ctx.characteristic_uuid,
+        characteristic_uuid,
+        sizeof(g_write_ctx.characteristic_uuid) - 1
+    );
+    memcpy(g_write_ctx.payload, data, data_len);
+    g_write_ctx.payload_len = data_len;
+    g_write_ctx.mtu = bt_gatt_get_mtu(entry->conn);
+    g_write_ctx.deadline_ms = k_uptime_get() + GATT_WRITE_TIMEOUT_MS;
+    g_write_ctx.conn = bt_conn_ref(entry->conn);
+    g_write_ctx.without_response = without_response;
 
-    rc = bt_gatt_write(entry->conn, &g_write_ctx.params);
-    if (rc != 0) {
-        emit_gatt_debug(
-            "write_submit_failed",
-            address,
-            characteristic_uuid,
-            handle,
-            bt_gatt_get_mtu(entry->conn),
-            data_len,
-            rc,
-            false
-        );
-        return rc;
+    emit_gatt_debug(
+        "write_accepted", address, characteristic_uuid, 0,
+        g_write_ctx.mtu, data_len, 0, without_response
+    );
+
+    if (get_cached_value_handle(address, characteristic_uuid, &handle)) {
+        g_write_ctx.value_handle = handle;
+        (void)submit_gatt_write();
+        return 0;
     }
 
-    if (k_sem_take(&g_write_ctx.done, K_SECONDS(5)) != 0) {
+    rc = bt_uuid_from_str(characteristic_uuid, &g_write_ctx.uuid);
+    if (rc < 0) {
+        g_write_ctx.result = rc;
+        atomic_set(&g_write_ctx.state, GATT_WRITE_COMPLETE);
+        return 0;
+    }
+
+    g_write_ctx.discover_params.uuid = &g_write_ctx.uuid.uuid;
+    g_write_ctx.discover_params.func = write_discover_cb;
+    g_write_ctx.discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+    g_write_ctx.discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+    g_write_ctx.discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+    atomic_set(&g_write_ctx.state, GATT_WRITE_DISCOVERING);
+
+    rc = bt_gatt_discover(g_write_ctx.conn, &g_write_ctx.discover_params);
+    if (rc != 0) {
+        g_write_ctx.result = rc;
+        atomic_set(&g_write_ctx.state, GATT_WRITE_COMPLETE);
         emit_gatt_debug(
-            "write_timeout",
-            address,
-            characteristic_uuid,
-            handle,
-            bt_gatt_get_mtu(entry->conn),
-            data_len,
-            -110,
-            false
+            "write_discovery_submit_failed", address, characteristic_uuid,
+            0, g_write_ctx.mtu, data_len, rc, false
         );
-        return -110;
+        return 0;
     }
 
     emit_gatt_debug(
-        "write_complete",
-        address,
-        characteristic_uuid,
-        handle,
-        bt_gatt_get_mtu(entry->conn),
-        data_len,
-        g_write_ctx.err,
+        "write_discovery_submitted", address, characteristic_uuid, 0,
+        g_write_ctx.mtu, data_len, 0, without_response
+    );
+    return 0;
+}
+
+bool ble_interface_write_is_busy(void)
+{
+    return gatt_write_state_is_busy(
+        (gatt_write_state_t)atomic_get(&g_write_ctx.state)
+    );
+}
+
+void ble_interface_write_cancel(int reason)
+{
+    atomic_val_t state = atomic_get(&g_write_ctx.state);
+
+    if (state == GATT_WRITE_IDLE || state == GATT_WRITE_COMPLETE ||
+        state == GATT_WRITE_CANCELLING) {
+        return;
+    }
+
+    g_write_ctx.cancellation_requested = true;
+    g_write_ctx.cancel_reason = reason != 0 ? reason : -ECANCELED;
+
+    gatt_write_state_t cancel_state = gatt_write_state_after_cancel(
+        (gatt_write_state_t)state
+    );
+
+    if (cancel_state == GATT_WRITE_COMPLETE) {
+        g_write_ctx.result = g_write_ctx.cancel_reason;
+        atomic_set(&g_write_ctx.state, GATT_WRITE_COMPLETE);
+        return;
+    }
+
+    if (!atomic_cas(&g_write_ctx.state, state, cancel_state)) {
+        return;
+    }
+
+    emit_gatt_debug(
+        "write_cancel_requested",
+        g_write_ctx.address,
+        g_write_ctx.characteristic_uuid,
+        g_write_ctx.value_handle,
+        g_write_ctx.mtu,
+        g_write_ctx.payload_len,
+        g_write_ctx.cancel_reason,
         false
     );
-    return g_write_ctx.err;
+
+    if (state == GATT_WRITE_DISCOVERING) {
+        bt_gatt_cancel(g_write_ctx.conn, &g_write_ctx.discover_params);
+    } else if (state == GATT_WRITE_ACTIVE) {
+        bt_gatt_cancel(g_write_ctx.conn, &g_write_ctx.params);
+    }
+}
+
+int ble_interface_write_poll(int *result_out)
+{
+    atomic_val_t state;
+
+    if (result_out == NULL) {
+        return -EINVAL;
+    }
+
+    state = atomic_get(&g_write_ctx.state);
+
+    if (state == GATT_WRITE_HANDLE_READY) {
+        put_cached_value_handle(
+            g_write_ctx.address,
+            g_write_ctx.characteristic_uuid,
+            g_write_ctx.value_handle
+        );
+        (void)submit_gatt_write();
+        state = atomic_get(&g_write_ctx.state);
+    }
+
+    if ((state == GATT_WRITE_DISCOVERING || state == GATT_WRITE_ACTIVE) &&
+        k_uptime_get() >= g_write_ctx.deadline_ms) {
+        emit_gatt_debug(
+            "write_timeout",
+            g_write_ctx.address,
+            g_write_ctx.characteristic_uuid,
+            g_write_ctx.value_handle,
+            g_write_ctx.mtu,
+            g_write_ctx.payload_len,
+            -ETIMEDOUT,
+            false
+        );
+        ble_interface_write_cancel(-ETIMEDOUT);
+        state = atomic_get(&g_write_ctx.state);
+    }
+
+    if (state != GATT_WRITE_COMPLETE) {
+        return 0;
+    }
+
+    *result_out = g_write_ctx.result;
+    emit_gatt_debug(
+        g_write_ctx.cancellation_requested
+            ? "write_cancellation_completed"
+            : (g_write_ctx.callback_seen
+                ? "write_completion_callback"
+                : "write_completed"),
+        g_write_ctx.address,
+        g_write_ctx.characteristic_uuid,
+        g_write_ctx.value_handle,
+        g_write_ctx.mtu,
+        g_write_ctx.payload_len,
+        g_write_ctx.result,
+        false
+    );
+
+    if (g_write_ctx.conn != NULL) {
+        bt_conn_unref(g_write_ctx.conn);
+    }
+
+    memset(&g_write_ctx, 0, sizeof(g_write_ctx));
+    return 1;
 }
 
 int ble_interface_get_rssi(const char *address, int8_t *rssi_out)

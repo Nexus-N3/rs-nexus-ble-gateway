@@ -6,6 +6,7 @@
 #include <strings.h>
 #include <stdio.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 
 static ble_scheduler_state_t g_state = SCHEDULER_STATE_IDLE;
 static int64_t g_scan_deadline_ms;
@@ -24,6 +25,7 @@ static uint8_t g_sensor_count = 0;
 #define NOTIFICATION_QUEUE_DEPTH 128
 #define NOTIFICATION_FLUSH_BUDGET 8
 #define ACTIVE_SUBSCRIPTION_MAX 32
+#define RESET_SESSION_TIMEOUT_MS 4000
 
 typedef struct {
     bool used;
@@ -55,6 +57,7 @@ typedef enum {
 
 typedef struct {
     bool pending;
+    bool started;
     gatt_op_type_t type;
     char request_id[GATEWAY_MAX_REQUEST_ID_LEN];
     char address[GATEWAY_MAX_ADDRESS_LEN];
@@ -68,6 +71,72 @@ typedef struct {
 
 static pending_gatt_op_t g_pending_gatt_op;
 
+enum gatt_worker_state {
+    GATT_WORKER_IDLE = 0,
+    GATT_WORKER_RUNNING,
+    GATT_WORKER_COMPLETE,
+};
+
+K_THREAD_STACK_DEFINE(g_gatt_worker_stack, 2048);
+static struct k_work_q g_gatt_worker_queue;
+static struct k_work g_gatt_worker;
+static atomic_t g_gatt_worker_state;
+static int g_gatt_worker_result;
+static uint8_t g_gatt_worker_read_data[GATEWAY_MAX_FRAME_PAYLOAD];
+static size_t g_gatt_worker_read_len;
+
+static bool g_reset_pending;
+static int g_reset_disconnect_rc;
+static int64_t g_reset_deadline_ms;
+static char g_reset_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
+
+static void run_blocking_gatt_op(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (g_pending_gatt_op.type == GATT_OP_READ) {
+        g_gatt_worker_read_len = sizeof(g_gatt_worker_read_data);
+        g_gatt_worker_result = ble_interface_read(
+            g_pending_gatt_op.address,
+            g_pending_gatt_op.characteristic_uuid,
+            g_gatt_worker_read_data,
+            &g_gatt_worker_read_len
+        );
+    } else if (g_pending_gatt_op.type == GATT_OP_SUBSCRIBE) {
+        g_gatt_worker_result = ble_interface_subscribe(
+            g_pending_gatt_op.address,
+            g_pending_gatt_op.characteristic_uuid,
+            g_pending_gatt_op.indicate
+        );
+    } else {
+        g_gatt_worker_result = -EINVAL;
+    }
+
+    atomic_set(&g_gatt_worker_state, GATT_WORKER_COMPLETE);
+}
+
+static int submit_blocking_gatt_op(void)
+{
+    if (!atomic_cas(
+            &g_gatt_worker_state,
+            GATT_WORKER_IDLE,
+            GATT_WORKER_RUNNING
+        )) {
+        return -EBUSY;
+    }
+
+    g_gatt_worker_result = 0;
+    g_gatt_worker_read_len = 0;
+    int rc = k_work_submit_to_queue(&g_gatt_worker_queue, &g_gatt_worker);
+    if (rc < 0) {
+        atomic_set(&g_gatt_worker_state, GATT_WORKER_IDLE);
+        return rc;
+    }
+
+    return 0;
+}
+
+
 typedef struct {
     char address[GATEWAY_MAX_ADDRESS_LEN];
     char characteristic_uuid[GATEWAY_MAX_UUID_LEN];
@@ -76,6 +145,7 @@ typedef struct {
     uint16_t payload_len;
     uint8_t payload[GATEWAY_MAX_FRAME_PAYLOAD];
     uint64_t gateway_time_us;
+    uint32_t receive_sequence;
 } pending_notification_t;
 
 static pending_notification_t g_notification_queue[NOTIFICATION_QUEUE_DEPTH];
@@ -143,6 +213,7 @@ static bool uuid_equals(const char *lhs, const char *rhs)
 
     return strcasecmp(lhs, rhs) == 0;
 }
+
 
 static bool should_emit_unmapped_warning(
     const char *address,
@@ -437,6 +508,15 @@ static int start_next_connect(void)
 
 int ble_scheduler_init(void)
 {
+    k_work_queue_start(
+        &g_gatt_worker_queue,
+        g_gatt_worker_stack,
+        K_THREAD_STACK_SIZEOF(g_gatt_worker_stack),
+        K_PRIO_PREEMPT(5),
+        NULL
+    );
+    k_work_init(&g_gatt_worker, run_blocking_gatt_op);
+    atomic_set(&g_gatt_worker_state, GATT_WORKER_IDLE);
     memset(g_notification_rx_stats, 0, sizeof(g_notification_rx_stats));
     memset(g_sensors, 0, sizeof(g_sensors));
     memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
@@ -455,6 +535,10 @@ int ble_scheduler_init(void)
     g_notification_drop_count = 0;
     g_connect_deadline_ms = 0;
     g_active_connect_address[0] = '\0';
+    g_reset_pending = false;
+    g_reset_disconnect_rc = 0;
+    g_reset_deadline_ms = 0;
+    g_reset_request_id[0] = '\0';
     g_state = SCHEDULER_STATE_IDLE;
     return 0;
 }
@@ -552,7 +636,11 @@ int ble_scheduler_disconnect_addresses(
 )
 {
     if (addresses == NULL || address_count == 0) {
-        return -1;
+        return -EINVAL;
+    }
+
+    if (atomic_get(&g_gatt_worker_state) != GATT_WORKER_IDLE) {
+        return -EBUSY;
     }
 
     memset(g_disconnect_request_id, 0, sizeof(g_disconnect_request_id));
@@ -653,7 +741,11 @@ int ble_scheduler_gatt_write(
 )
 {
     if (address == NULL || characteristic_uuid == NULL || data == NULL) {
-        return -1;
+        return -EINVAL;
+    }
+
+    if (data_len == 0 || data_len > GATEWAY_MAX_FRAME_PAYLOAD) {
+        return -EMSGSIZE;
     }
 
     if (g_pending_gatt_op.pending) {
@@ -677,10 +769,6 @@ int ble_scheduler_gatt_write(
             request_id,
             sizeof(g_pending_gatt_op.request_id) - 1
         );
-    }
-    if (data_len > sizeof(g_pending_gatt_op.payload)) {
-        data_len = sizeof(g_pending_gatt_op.payload);
-        g_pending_gatt_op.payload_len = data_len;
     }
     memcpy(g_pending_gatt_op.payload, data, data_len);
     return 0;
@@ -721,6 +809,10 @@ int ble_scheduler_gatt_read(
 
 int ble_scheduler_disconnect_all(void)
 {
+    if (atomic_get(&g_gatt_worker_state) != GATT_WORKER_IDLE) {
+        return -EBUSY;
+    }
+
     int rc = ble_interface_disconnect_all();
 
     g_disconnect_pending_count = 0;
@@ -731,7 +823,6 @@ int ble_scheduler_disconnect_all(void)
     g_connect_queue_count = 0;
     g_connect_queue_index = 0;
     memset(g_connect_queue, 0, sizeof(g_connect_queue));
-    memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
     memset(g_notification_queue, 0, sizeof(g_notification_queue));
     g_notification_head = 0;
     g_notification_tail = 0;
@@ -744,12 +835,8 @@ int ble_scheduler_disconnect_all(void)
     return rc;
 }
 
-int ble_scheduler_reset_session(void)
+static void clear_scheduler_session_state(void)
 {
-    int rc = ble_interface_disconnect_all();
-
-    ble_interface_reset_state();
-
     memset(g_sensors, 0, sizeof(g_sensors));
     g_sensor_count = 0;
     g_scan_active = false;
@@ -774,7 +861,28 @@ int ble_scheduler_reset_session(void)
     g_subscription_table_overflow_count = 0;
     g_state = SCHEDULER_STATE_IDLE;
     memset(g_notification_rx_stats, 0, sizeof(g_notification_rx_stats));
-    return rc;
+}
+
+int ble_scheduler_reset_session(const char *request_id)
+{
+    if (g_reset_pending ||
+        atomic_get(&g_gatt_worker_state) != GATT_WORKER_IDLE) {
+        return -EBUSY;
+    }
+
+    memset(g_reset_request_id, 0, sizeof(g_reset_request_id));
+    if (request_id != NULL) {
+        strncpy(
+            g_reset_request_id,
+            request_id,
+            sizeof(g_reset_request_id) - 1
+        );
+    }
+
+    g_reset_pending = true;
+    g_reset_deadline_ms = k_uptime_get() + RESET_SESSION_TIMEOUT_MS;
+    g_reset_disconnect_rc = ble_interface_disconnect_all();
+    return 0;
 }
 
 int ble_scheduler_get_status(void)
@@ -869,6 +977,84 @@ void ble_scheduler_tick(void)
 {
     bool handled_gatt_op = false;
 
+    if (g_reset_pending) {
+        int write_result = 0;
+        int write_poll_rc = ble_interface_write_poll(&write_result);
+
+        ARG_UNUSED(write_result);
+
+        if (write_poll_rc < 0) {
+            gateway_interface_send_error(
+                g_reset_request_id[0] != '\0' ? g_reset_request_id : NULL,
+                "reset_session_failed",
+                write_poll_rc
+            );
+            g_reset_pending = false;
+            return;
+        }
+
+        if (ble_interface_write_is_busy() ||
+            ble_interface_active_connection_count() > 0) {
+            if (k_uptime_get() >= g_reset_deadline_ms) {
+                gateway_interface_send_error(
+                    g_reset_request_id[0] != '\0'
+                        ? g_reset_request_id
+                        : NULL,
+                    "reset_session_failed",
+                    -ETIMEDOUT
+                );
+                g_reset_pending = false;
+            }
+            flush_notification_queue(NOTIFICATION_FLUSH_BUDGET);
+            return;
+        }
+
+        int reset_rc = ble_interface_reset_state();
+        if (reset_rc == -EBUSY) {
+            return;
+        }
+
+        if (reset_rc != 0) {
+            gateway_interface_send_error(
+                g_reset_request_id[0] != '\0' ? g_reset_request_id : NULL,
+                "reset_session_failed",
+                reset_rc
+            );
+        } else if (g_reset_disconnect_rc != 0) {
+            clear_scheduler_session_state();
+            gateway_interface_send_error(
+                g_reset_request_id[0] != '\0' ? g_reset_request_id : NULL,
+                "reset_session_failed",
+                g_reset_disconnect_rc
+            );
+        } else {
+            char line[128];
+            char completed_request_id[GATEWAY_MAX_REQUEST_ID_LEN];
+
+            strncpy(
+                completed_request_id,
+                g_reset_request_id,
+                sizeof(completed_request_id) - 1
+            );
+            completed_request_id[sizeof(completed_request_id) - 1] = '\0';
+            clear_scheduler_session_state();
+            snprintf(
+                line,
+                sizeof(line),
+                "{\"type\":\"reset_session_complete\","
+                "\"request_id\":\"%s\",\"ok\":true}",
+                completed_request_id
+            );
+            gateway_interface_send_json_line(line);
+        }
+
+        g_reset_pending = false;
+        g_reset_disconnect_rc = 0;
+        g_reset_deadline_ms = 0;
+        g_reset_request_id[0] = '\0';
+        return;
+    }
+
     if (g_scan_active && k_uptime_get() >= g_scan_deadline_ms) {
         ble_scheduler_stop_scan();
     }
@@ -901,133 +1087,198 @@ void ble_scheduler_tick(void)
 
     
     if (g_pending_gatt_op.pending && g_pending_gatt_op.type == GATT_OP_READ) {
-        uint8_t buffer[GATEWAY_MAX_FRAME_PAYLOAD];
-        size_t data_len = sizeof(buffer);
-        int rc = ble_interface_read(
-            g_pending_gatt_op.address,
-            g_pending_gatt_op.characteristic_uuid,
-            buffer,
-            &data_len
-        );
-
-        if (rc != 0) {
-            gateway_interface_send_error(
-                g_pending_gatt_op.request_id[0] != '\0' ? g_pending_gatt_op.request_id : NULL,
-                "gatt_read_failed",
-                rc
-            );
-        } else {
-            static const char hex_chars[] = "0123456789ABCDEF";
-            char payload_hex[(GATEWAY_MAX_FRAME_PAYLOAD * 2) + 1];
-            char line[768];
-
-            for (size_t i = 0; i < data_len; i++) {
-                payload_hex[i * 2] = hex_chars[(buffer[i] >> 4) & 0x0F];
-                payload_hex[i * 2 + 1] = hex_chars[buffer[i] & 0x0F];
-            }
-            payload_hex[data_len * 2] = '\0';
-
-            snprintf(
-                line,
-                sizeof(line),
-                "{\"type\":\"read_result\",\"request_id\":\"%s\","
-                "\"address\":\"%s\",\"characteristic_uuid\":\"%s\","
-                "\"payload_hex\":\"%s\",\"ok\":true}",
-                g_pending_gatt_op.request_id,
-                g_pending_gatt_op.address,
-                g_pending_gatt_op.characteristic_uuid,
-                payload_hex
-            );
-            gateway_interface_send_json_line(line);
-        }
-        memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
-        handled_gatt_op = true;
-    } else if (g_pending_gatt_op.pending && g_pending_gatt_op.type == GATT_OP_WRITE) {
-        int rc = ble_interface_write(
-            g_pending_gatt_op.address,
-            g_pending_gatt_op.characteristic_uuid,
-            g_pending_gatt_op.payload,
-            g_pending_gatt_op.payload_len,
-            g_pending_gatt_op.without_response
-        );
-
-        if (rc != 0) {
-            gateway_interface_send_error(
-                g_pending_gatt_op.request_id[0] != '\0' ? g_pending_gatt_op.request_id : NULL,
-                "gatt_write_failed",
-                rc
-            );
-        } else {
-            char line[256];
-            snprintf(
-                line,
-                sizeof(line),
-                "{\"type\":\"write_complete\",\"request_id\":\"%s\","
-                "\"address\":\"%s\",\"characteristic_uuid\":\"%s\",\"ok\":true}",
-                g_pending_gatt_op.request_id,
-                g_pending_gatt_op.address,
-                g_pending_gatt_op.characteristic_uuid
-            );
-            gateway_interface_send_json_line(line);
-        }
-        memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
-        handled_gatt_op = true;
-    } else if (g_pending_gatt_op.pending && g_pending_gatt_op.type == GATT_OP_SUBSCRIBE) {
-        uint8_t sensor_id = 0U;
-        int rc = ble_interface_subscribe(
-            g_pending_gatt_op.address,
-            g_pending_gatt_op.characteristic_uuid,
-            g_pending_gatt_op.indicate
-        );
-
-        if (rc != 0) {
-            gateway_interface_send_error(
-                g_pending_gatt_op.request_id[0] != '\0'
-                    ? g_pending_gatt_op.request_id
-                    : NULL,
-                "subscribe_failed",
-                rc
-            );
-        } else {
-            int reg_rc = register_active_subscription(
-                g_pending_gatt_op.address,
-                g_pending_gatt_op.characteristic_uuid,
-                g_pending_gatt_op.binary_notifications,
-                &sensor_id
-            );
-
-            if (reg_rc != 0) {
+        if (!g_pending_gatt_op.started) {
+            int submit_rc = submit_blocking_gatt_op();
+            if (submit_rc != 0) {
                 gateway_interface_send_error(
                     g_pending_gatt_op.request_id[0] != '\0'
                         ? g_pending_gatt_op.request_id
                         : NULL,
-                    "subscription_register_failed",
-                    reg_rc
+                    "gatt_read_failed",
+                    submit_rc
+                );
+                memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+                handled_gatt_op = true;
+            } else {
+                g_pending_gatt_op.started = true;
+            }
+        }
+
+        if (g_pending_gatt_op.pending &&
+            atomic_get(&g_gatt_worker_state) == GATT_WORKER_COMPLETE) {
+            if (g_gatt_worker_result != 0) {
+                gateway_interface_send_error(
+                    g_pending_gatt_op.request_id[0] != '\0'
+                        ? g_pending_gatt_op.request_id
+                        : NULL,
+                    "gatt_read_failed",
+                    g_gatt_worker_result
                 );
             } else {
-                char line[256];
+                static const char hex_chars[] = "0123456789ABCDEF";
+                char payload_hex[(GATEWAY_MAX_FRAME_PAYLOAD * 2) + 1];
+                char line[768];
+
+                for (size_t i = 0; i < g_gatt_worker_read_len; i++) {
+                    payload_hex[i * 2] =
+                        hex_chars[(g_gatt_worker_read_data[i] >> 4) & 0x0F];
+                    payload_hex[i * 2 + 1] =
+                        hex_chars[g_gatt_worker_read_data[i] & 0x0F];
+                }
+                payload_hex[g_gatt_worker_read_len * 2] = '\0';
 
                 snprintf(
                     line,
                     sizeof(line),
-                    "{\"type\":\"subscribe_complete\","
-                    "\"request_id\":\"%s\","
-                    "\"address\":\"%s\","
-                    "\"sensor_id\":%u,"
-                    "\"characteristic_uuid\":\"%s\","
-                    "\"ok\":true}",
+                    "{\"type\":\"read_result\",\"request_id\":\"%s\","
+                    "\"address\":\"%s\",\"characteristic_uuid\":\"%s\","
+                    "\"payload_hex\":\"%s\",\"ok\":true}",
                     g_pending_gatt_op.request_id,
                     g_pending_gatt_op.address,
-                    (unsigned int)sensor_id,
-                    g_pending_gatt_op.characteristic_uuid
+                    g_pending_gatt_op.characteristic_uuid,
+                    payload_hex
                 );
-
                 gateway_interface_send_json_line(line);
+            }
+
+            atomic_set(&g_gatt_worker_state, GATT_WORKER_IDLE);
+            memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+            handled_gatt_op = true;
+        }
+    } else if (g_pending_gatt_op.pending &&
+               g_pending_gatt_op.type == GATT_OP_WRITE) {
+        int rc = 0;
+
+        if (!g_pending_gatt_op.started) {
+            rc = ble_interface_write(
+                g_pending_gatt_op.address,
+                g_pending_gatt_op.characteristic_uuid,
+                g_pending_gatt_op.payload,
+                g_pending_gatt_op.payload_len,
+                g_pending_gatt_op.without_response
+            );
+
+            if (rc != 0) {
+                gateway_interface_send_error(
+                    g_pending_gatt_op.request_id[0] != '\0'
+                        ? g_pending_gatt_op.request_id
+                        : NULL,
+                    "gatt_write_failed",
+                    rc
+                );
+                memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+                handled_gatt_op = true;
+            } else {
+                g_pending_gatt_op.started = true;
             }
         }
 
-        memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
-        handled_gatt_op = true;
+        if (g_pending_gatt_op.pending && g_pending_gatt_op.started) {
+            int write_result = 0;
+            int poll_rc = ble_interface_write_poll(&write_result);
+
+            if (poll_rc < 0) {
+                write_result = poll_rc;
+                poll_rc = 1;
+            }
+
+            if (poll_rc == 1) {
+                if (write_result != 0) {
+                    gateway_interface_send_error(
+                        g_pending_gatt_op.request_id[0] != '\0'
+                            ? g_pending_gatt_op.request_id
+                            : NULL,
+                        "gatt_write_failed",
+                        write_result
+                    );
+                } else {
+                    char line[256];
+                    snprintf(
+                        line,
+                        sizeof(line),
+                        "{\"type\":\"write_complete\","
+                        "\"request_id\":\"%s\","
+                        "\"address\":\"%s\","
+                        "\"characteristic_uuid\":\"%s\",\"ok\":true}",
+                        g_pending_gatt_op.request_id,
+                        g_pending_gatt_op.address,
+                        g_pending_gatt_op.characteristic_uuid
+                    );
+                    gateway_interface_send_json_line(line);
+                }
+
+                memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+                handled_gatt_op = true;
+            }
+        }
+    } else if (g_pending_gatt_op.pending &&
+               g_pending_gatt_op.type == GATT_OP_SUBSCRIBE) {
+        if (!g_pending_gatt_op.started) {
+            int submit_rc = submit_blocking_gatt_op();
+            if (submit_rc != 0) {
+                gateway_interface_send_error(
+                    g_pending_gatt_op.request_id[0] != '\0'
+                        ? g_pending_gatt_op.request_id
+                        : NULL,
+                    "subscribe_failed",
+                    submit_rc
+                );
+                memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+                handled_gatt_op = true;
+            } else {
+                g_pending_gatt_op.started = true;
+            }
+        }
+
+        if (g_pending_gatt_op.pending &&
+            atomic_get(&g_gatt_worker_state) == GATT_WORKER_COMPLETE) {
+            if (g_gatt_worker_result != 0) {
+                gateway_interface_send_error(
+                    g_pending_gatt_op.request_id[0] != '\0'
+                        ? g_pending_gatt_op.request_id
+                        : NULL,
+                    "subscribe_failed",
+                    g_gatt_worker_result
+                );
+            } else {
+                uint8_t sensor_id = 0U;
+                int reg_rc = register_active_subscription(
+                    g_pending_gatt_op.address,
+                    g_pending_gatt_op.characteristic_uuid,
+                    g_pending_gatt_op.binary_notifications,
+                    &sensor_id
+                );
+
+                if (reg_rc != 0) {
+                    gateway_interface_send_error(
+                        g_pending_gatt_op.request_id[0] != '\0'
+                            ? g_pending_gatt_op.request_id
+                            : NULL,
+                        "subscription_register_failed",
+                        reg_rc
+                    );
+                } else {
+                    char line[256];
+                    snprintf(
+                        line,
+                        sizeof(line),
+                        "{\"type\":\"subscribe_complete\","
+                        "\"request_id\":\"%s\",\"address\":\"%s\","
+                        "\"sensor_id\":%u,\"characteristic_uuid\":\"%s\","
+                        "\"ok\":true}",
+                        g_pending_gatt_op.request_id,
+                        g_pending_gatt_op.address,
+                        (unsigned int)sensor_id,
+                        g_pending_gatt_op.characteristic_uuid
+                    );
+                    gateway_interface_send_json_line(line);
+                }
+            }
+
+            atomic_set(&g_gatt_worker_state, GATT_WORKER_IDLE);
+            memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
+            handled_gatt_op = true;
+        }
     }
 
     if (handled_gatt_op) {
@@ -1255,7 +1506,8 @@ void ble_scheduler_on_notification(
     const char *characteristic_uuid,
     const uint8_t *payload,
     size_t payload_len,
-    uint64_t gateway_time_us
+    uint64_t gateway_time_us,
+    uint32_t receive_sequence
 )
 {
     pending_notification_t *slot;
@@ -1334,6 +1586,7 @@ void ble_scheduler_on_notification(
     slot->payload_len = (uint16_t)payload_len;
     memcpy(slot->payload, payload, payload_len);
     slot->gateway_time_us = gateway_time_us;
+    slot->receive_sequence = receive_sequence;
 
     g_notification_tail =
         (uint16_t)((g_notification_tail + 1U) % NOTIFICATION_QUEUE_DEPTH);
