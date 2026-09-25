@@ -12,7 +12,8 @@
 
 #include "../hardware/led.h"
 
-#define TX_CHUNK_SIZE 256
+#define TX_CONTROL_CHUNK_SIZE 256U
+#define TX_CHUNK_SIZE (14U + GATEWAY_MAX_FRAME_PAYLOAD)
 #define RX_LINE_MAX 512 //do not increase this 1024 squashes connect on 9 sensors and drain on lower than 9
 #define UART_RX_BUF_SIZE 256
 #define TX_CONTROL_RING_SIZE 8192
@@ -192,31 +193,121 @@ static int tx_dequeue_into_buf(
     size_t len = 0;
     unsigned int key = irq_lock();
 
+    /*
+     * Preserve the original control transport behaviour exactly:
+     * control traffic is still transmitted in chunks of at most 256 bytes.
+     */
     if (tx_control_count > 0) {
+        size_t control_limit = TX_CONTROL_CHUNK_SIZE;
+
+        if (control_limit > buf_size) {
+            control_limit = buf_size;
+        }
+
         if (queue_kind_out != NULL) {
             *queue_kind_out = TX_QUEUE_CONTROL;
         }
-        while (tx_control_count > 0 && len < buf_size) {
+
+        while (
+            tx_control_count > 0
+            && len < control_limit
+        ) {
             buf[len++] = tx_control_ring[tx_control_head];
-            tx_control_head = (tx_control_head + 1U) % TX_CONTROL_RING_SIZE;
+            tx_control_head =
+                (tx_control_head + 1U) % TX_CONTROL_RING_SIZE;
             tx_control_count--;
         }
+
         tx_control_bytes_dequeued += (uint32_t)len;
+
     } else {
+        size_t scan_index = tx_stream_head;
+        size_t available = tx_stream_count;
+
         if (queue_kind_out != NULL) {
             *queue_kind_out = TX_QUEUE_STREAM;
         }
-        while (tx_stream_count > 0 && len < buf_size) {
-            buf[len++] = tx_stream_ring[tx_stream_head];
-            tx_stream_head = (tx_stream_head + 1U) % TX_STREAM_RING_SIZE;
-            tx_stream_count--;
+
+        /*
+         * Build the UART batch from COMPLETE binary frames only.
+         *
+         * Frame format:
+         *
+         *   sync        2 bytes
+         *   version     1 byte
+         *   sensor id   1 byte
+         *   timestamp   8 bytes
+         *   payload len 1 byte
+         *   payload     N bytes
+         *   checksum    1 byte
+         *
+         * Total = 14 + payload_len.
+         *
+         * Multiple complete frames may be packed into one UART TX,
+         * but the next frame is never partially removed from the ring.
+         */
+        while (available >= 14U) {
+            size_t payload_len;
+            size_t frame_len;
+
+            payload_len = tx_stream_ring[
+                (scan_index + 12U) % TX_STREAM_RING_SIZE
+            ];
+
+            frame_len = 14U + payload_len;
+
+            /*
+             * The complete frame has not yet reached the ring.
+             * Leave it untouched until more bytes are available.
+             */
+            if (available < frame_len) {
+                break;
+            }
+
+            /*
+             * TX_CHUNK_SIZE is sized to hold the maximum legal frame,
+             * so this should never occur for a valid frame.
+             */
+            if (frame_len > buf_size) {
+                break;
+            }
+
+            /*
+             * Do not take even one byte from the next frame unless that
+             * whole frame fits in this UART transmission.
+             */
+            if ((len + frame_len) > buf_size) {
+                break;
+            }
+
+            for (size_t i = 0; i < frame_len; i++) {
+                buf[len + i] = tx_stream_ring[
+                    (scan_index + i) % TX_STREAM_RING_SIZE
+                ];
+            }
+
+            len += frame_len;
+            scan_index =
+                (scan_index + frame_len) % TX_STREAM_RING_SIZE;
+            available -= frame_len;
         }
-        tx_stream_bytes_dequeued += (uint32_t)len;
+
+        /*
+         * Only now advance the ring head. Therefore every byte removed
+         * from the stream ring belongs to a complete frame.
+         */
+        if (len > 0) {
+            tx_stream_head = scan_index;
+            tx_stream_count -= len;
+            tx_stream_bytes_dequeued += (uint32_t)len;
+        }
     }
 
     irq_unlock(key);
+
     return (int)len;
 }
+
 
 static void mark_rx_buf_free(const uint8_t *buf)
 {
