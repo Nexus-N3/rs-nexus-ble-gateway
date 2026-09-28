@@ -29,6 +29,7 @@
 #define BLE_CONN_SUPERVISION_TIMEOUT_UNITS 400 /* 4 s */
 #define GATT_HANDLE_CACHE_SIZE (GATEWAY_MAX_SENSORS * 4)
 #define GATT_WRITE_TIMEOUT_MS 4000
+#define GATT_WRITE_CANCEL_TIMEOUT_MS 1000
 
 
 static const struct bt_le_conn_param g_ble_conn_param = {
@@ -64,10 +65,12 @@ typedef struct {
     uint16_t value_handle;
     uint16_t mtu;
     int64_t deadline_ms;
+    int64_t cancel_deadline_ms;
     int result;
     int cancel_reason;
     bool callback_seen;
     bool cancellation_requested;
+    bool recovery_disconnect_requested;
     bool without_response;
 } gatt_write_ctx_t;
 
@@ -1733,6 +1736,8 @@ void ble_interface_write_cancel(int reason)
 
     g_write_ctx.cancellation_requested = true;
     g_write_ctx.cancel_reason = reason != 0 ? reason : -ECANCELED;
+    g_write_ctx.cancel_deadline_ms =
+        k_uptime_get() + GATT_WRITE_CANCEL_TIMEOUT_MS;
 
     gatt_write_state_t cancel_state = gatt_write_state_after_cancel(
         (gatt_write_state_t)state
@@ -1800,6 +1805,32 @@ int ble_interface_write_poll(int *result_out)
         );
         ble_interface_write_cancel(-ETIMEDOUT);
         state = atomic_get(&g_write_ctx.state);
+    }
+
+    if (state == GATT_WRITE_CANCELLING &&
+        g_write_ctx.cancel_deadline_ms > 0 &&
+        k_uptime_get() >= g_write_ctx.cancel_deadline_ms &&
+        !g_write_ctx.recovery_disconnect_requested) {
+
+        g_write_ctx.recovery_disconnect_requested = true;
+
+        emit_gatt_debug(
+            "write_cancel_timeout_disconnect",
+            g_write_ctx.address,
+            g_write_ctx.characteristic_uuid,
+            g_write_ctx.value_handle,
+            g_write_ctx.mtu,
+            g_write_ctx.payload_len,
+            g_write_ctx.cancel_reason,
+            false
+        );
+
+        if (g_write_ctx.conn != NULL) {
+            (void)bt_conn_disconnect(
+                g_write_ctx.conn,
+                BT_HCI_ERR_REMOTE_USER_TERM_CONN
+            );
+        }
     }
 
     if (state != GATT_WRITE_COMPLETE) {

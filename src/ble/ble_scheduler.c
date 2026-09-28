@@ -58,6 +58,8 @@ typedef enum {
 typedef struct {
     bool pending;
     bool started;
+    bool timeout_snapshot_emitted;
+    int64_t started_ms;
     gatt_op_type_t type;
     char request_id[GATEWAY_MAX_REQUEST_ID_LEN];
     char address[GATEWAY_MAX_ADDRESS_LEN];
@@ -1170,11 +1172,39 @@ void ble_scheduler_tick(void)
                 handled_gatt_op = true;
             } else {
                 g_pending_gatt_op.started = true;
+                g_pending_gatt_op.started_ms = k_uptime_get();
+                g_pending_gatt_op.timeout_snapshot_emitted = false;
+
             }
         }
 
         if (g_pending_gatt_op.pending && g_pending_gatt_op.started) {
             int write_result = 0;
+
+            /*
+            * Diagnostic only.
+            *
+            * Capture BLE notification and UART transport state once if a GATT
+            * write has remained outstanding close to the BLE write timeout.
+            */
+            if (
+                !g_pending_gatt_op.timeout_snapshot_emitted &&
+                g_pending_gatt_op.started_ms > 0 &&
+                (k_uptime_get() - g_pending_gatt_op.started_ms) >= 3900
+            ) {
+                g_pending_gatt_op.timeout_snapshot_emitted = true;
+
+                gateway_interface_send_transport_stats();
+
+                ble_scheduler_report_notification_rx_stats(
+                    g_pending_gatt_op.request_id[0] != '\0'
+                        ? g_pending_gatt_op.request_id
+                        : NULL
+                );
+
+                
+            }
+
             int poll_rc = ble_interface_write_poll(&write_result);
 
             if (poll_rc < 0) {
