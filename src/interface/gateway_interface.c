@@ -2255,21 +2255,19 @@ int gateway_interface_poll(void)
 
     irq_unlock(key);
 
-
-
     transport_try_start_tx();
 
-
-
     if (now >= next_transport_stats_ms) {
-
         next_transport_stats_ms = now + 10000;
 
-        gateway_interface_send_transport_stats();
+        /*
+        * Periodic transport stats disabled during stability testing.
+        * Full transport statistics remain available through explicit
+        * status requests and failure diagnostics.
+        */
+        //gateway_interface_send_transport_stats();
 
     }
-
-
 
     if (tx_abort_report_pending) {
 
