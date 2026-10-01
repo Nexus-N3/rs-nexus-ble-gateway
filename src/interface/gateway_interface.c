@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "../hardware/led.h"
 
@@ -120,6 +121,8 @@ static volatile int64_t tx_active_started_ms;
 static volatile uint32_t tx_stuck_count;
 
 static volatile bool tx_stuck_reported;
+
+static volatile bool tx_recovery_in_progress;
 
 static volatile uint32_t tx_done_buffer_pointer_mismatches;
 
@@ -674,7 +677,7 @@ static void transport_try_start_tx(void)
 
     unsigned int key = irq_lock();
 
-    if (tx_in_progress) {
+    if (tx_in_progress || tx_recovery_in_progress) {
 
         irq_unlock(key);
 
@@ -1815,6 +1818,8 @@ static void uart_cb(
 
         unsigned int key = irq_lock();
 
+        bool start_next = !tx_recovery_in_progress;
+
 
 
         size_t expected_len = tx_active_len;
@@ -1874,7 +1879,11 @@ static void uart_cb(
 
 
 
-        transport_try_start_tx();
+        if (start_next) {
+
+            transport_try_start_tx();
+
+        }
 
         break;
 
@@ -1885,6 +1894,8 @@ static void uart_cb(
     case UART_TX_ABORTED: {
 
         unsigned int key = irq_lock();
+
+        bool start_next = !tx_recovery_in_progress;
 
         if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
 
@@ -1909,7 +1920,11 @@ static void uart_cb(
 
         irq_unlock(key);
 
-        transport_try_start_tx();
+        if (start_next) {
+
+            transport_try_start_tx();
+
+        }
 
         break;
 
@@ -2076,6 +2091,8 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
 
     tx_stuck_reported = false;
 
+    tx_recovery_in_progress = false;
+
 
     tx_done_buffer_pointer_mismatches = 0;
 
@@ -2200,6 +2217,8 @@ int gateway_interface_reset_transport_state(void)
 
     tx_stuck_reported = false;
 
+    tx_recovery_in_progress = false;
+
 
     tx_done_buffer_pointer_mismatches = 0;
 
@@ -2227,6 +2246,8 @@ int gateway_interface_poll(void)
 
     int64_t now = k_uptime_get();
 
+    bool recover_stuck_tx = false;
+
 
 
     unsigned int key = irq_lock();
@@ -2249,11 +2270,45 @@ int gateway_interface_poll(void)
 
         tx_stuck_count++;
 
+        tx_recovery_in_progress = true;
+
+        recover_stuck_tx = true;
+
     }
 
 
 
     irq_unlock(key);
+
+    if (recover_stuck_tx) {
+
+        int abort_rc = uart_tx_abort(uart_dev);
+
+        key = irq_lock();
+
+        if (abort_rc == -EFAULT && tx_in_progress) {
+
+            /* The driver confirms that no hardware TX is active. */
+            tx_active_len = 0;
+
+            tx_active_started_ms = 0;
+
+            tx_in_progress = false;
+
+        } else if (tx_in_progress) {
+
+            /* No completion arrived; retry after another stuck interval. */
+            tx_active_started_ms = now;
+
+            tx_stuck_reported = false;
+
+        }
+
+        tx_recovery_in_progress = false;
+
+        irq_unlock(key);
+
+    }
 
     transport_try_start_tx();
 
