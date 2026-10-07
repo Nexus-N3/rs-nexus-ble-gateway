@@ -126,6 +126,14 @@ static volatile bool tx_recovery_in_progress;
 
 static volatile uint32_t tx_done_buffer_pointer_mismatches;
 
+/* All fields below are protected by irq_lock, like the TX rings. */
+static int64_t tx_stream_not_before_ms;
+static uint32_t tx_stream_pacing_delays;
+static size_t tx_stream_high_water_bytes;
+static uint32_t tx_stream_pressure_events;
+static int64_t tx_stream_backlog_since_ms;
+static uint32_t tx_stream_backlog_max_ms;
+
 static int64_t next_transport_stats_ms;
 
 static void transport_try_start_tx(void);
@@ -299,6 +307,17 @@ static int tx_enqueue_bytes(
         tx_stream_enqueue_success_count++;
 
         tx_stream_bytes_enqueued += (uint32_t)len;
+        if (*count == len) {
+            tx_stream_backlog_since_ms = k_uptime_get();
+        }
+        if (*count > tx_stream_high_water_bytes) {
+            tx_stream_high_water_bytes = *count;
+        }
+        /* Count crossings, rather than every enqueue above the threshold. */
+        if (*count >= GATEWAY_STREAM_PRESSURE_BYTES &&
+            (*count - len) < GATEWAY_STREAM_PRESSURE_BYTES) {
+            tx_stream_pressure_events++;
+        }
 
     }
 
@@ -574,23 +593,9 @@ static int tx_dequeue_into_buf(
 
 
 
-        /*
-
-         * Only now advance the ring head. Therefore every byte removed
-
-         * from the stream ring belongs to a complete frame.
-
+        /* Peek only: retain stream bytes until uart_tx accepts the batch.
+         * This also reserves their ring capacity against concurrent enqueue.
          */
-
-        if (len > 0) {
-
-            tx_stream_head = scan_index;
-
-            tx_stream_count -= len;
-
-            tx_stream_bytes_dequeued += (uint32_t)len;
-
-        }
 
     }
 
@@ -685,6 +690,13 @@ static void transport_try_start_tx(void)
 
     }
 
+    if (tx_control_count == 0 && tx_stream_count > 0 &&
+        k_uptime_get() < tx_stream_not_before_ms) {
+        tx_stream_pacing_delays++;
+        irq_unlock(key);
+        return;
+    }
+
     tx_in_progress = true;
 
     irq_unlock(key);
@@ -723,10 +735,9 @@ static void transport_try_start_tx(void)
 
     tx_stuck_reported = false;
 
-    irq_unlock(key);
-
-
-
+    /* Keep completion callbacks masked until accepted stream bytes have
+     * been accounted for. uart_tx is a nonblocking driver operation.
+     */
     int rc = uart_tx(
 
         uart_dev,
@@ -741,9 +752,20 @@ static void transport_try_start_tx(void)
 
 
 
-    if (rc != 0) {
+    if (rc == 0 && queue_kind == TX_QUEUE_STREAM) {
+        uint32_t age = (uint32_t)(k_uptime_get() - tx_stream_backlog_since_ms);
+        if (age > tx_stream_backlog_max_ms) {
+            tx_stream_backlog_max_ms = age;
+        }
+        tx_stream_head = (tx_stream_head + (size_t)len) % TX_STREAM_RING_SIZE;
+        tx_stream_count -= (size_t)len;
+        tx_stream_bytes_dequeued += (uint32_t)len;
+        if (tx_stream_count == 0) {
+            tx_stream_backlog_since_ms = 0;
+        }
+    }
 
-        key = irq_lock();
+    if (rc != 0) {
 
         if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
 
@@ -755,6 +777,9 @@ static void transport_try_start_tx(void)
 
         }
 
+        tx_stream_not_before_ms =
+            k_uptime_get() + GATEWAY_STREAM_TX_GAP_MS;
+
         tx_active_len = 0;
 
 
@@ -764,9 +789,9 @@ static void transport_try_start_tx(void)
 
         tx_in_progress = false;
 
-        irq_unlock(key);
-
     }
+
+    irq_unlock(key);
 
 }
 
@@ -1866,6 +1891,9 @@ static void uart_cb(
 
 
 
+        tx_stream_not_before_ms =
+            k_uptime_get() + GATEWAY_STREAM_TX_GAP_MS;
+
         tx_active_len = 0;
 
 
@@ -1910,6 +1938,9 @@ static void uart_cb(
 
 
         tx_abort_report_pending = true;
+
+        tx_stream_not_before_ms =
+            k_uptime_get() + GATEWAY_STREAM_TX_GAP_MS;
 
         tx_active_len = 0;
 
@@ -2039,6 +2070,12 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
     tx_stream_count = 0;
 
     tx_stream_drop_count = 0;
+    tx_stream_not_before_ms = 0;
+    tx_stream_pacing_delays = 0;
+    tx_stream_high_water_bytes = 0;
+    tx_stream_pressure_events = 0;
+    tx_stream_backlog_since_ms = 0;
+    tx_stream_backlog_max_ms = 0;
 
     tx_control_enqueue_success_count = 0;
 
@@ -2171,6 +2208,12 @@ int gateway_interface_reset_transport_state(void)
     tx_stream_count = 0;
 
     tx_stream_drop_count = 0;
+    tx_stream_not_before_ms = 0;
+    tx_stream_pacing_delays = 0;
+    tx_stream_high_water_bytes = 0;
+    tx_stream_pressure_events = 0;
+    tx_stream_backlog_since_ms = 0;
+    tx_stream_backlog_max_ms = 0;
 
     tx_control_enqueue_success_count = 0;
 
@@ -2254,6 +2297,13 @@ int gateway_interface_poll(void)
 
 
 
+    if (tx_stream_count > 0) {
+        uint32_t age = (uint32_t)(now - tx_stream_backlog_since_ms);
+        if (age > tx_stream_backlog_max_ms) {
+            tx_stream_backlog_max_ms = age;
+        }
+    }
+
     if (
 
         tx_in_progress &&
@@ -2289,6 +2339,7 @@ int gateway_interface_poll(void)
         if (abort_rc == -EFAULT && tx_in_progress) {
 
             /* The driver confirms that no hardware TX is active. */
+            tx_stream_not_before_ms = now + GATEWAY_STREAM_TX_GAP_MS;
             tx_active_len = 0;
 
             tx_active_started_ms = 0;
@@ -2595,13 +2646,20 @@ int gateway_interface_send_transport_stats(void)
 
 {
 
-    char line[896];
+    char line[1280];
 
     unsigned int key = irq_lock();
 
     const size_t control_ring_count = tx_control_count;
 
     const size_t stream_ring_count = tx_stream_count;
+    const uint32_t pacing_delays = tx_stream_pacing_delays;
+    const size_t stream_high_water = tx_stream_high_water_bytes;
+    const uint32_t pressure_events = tx_stream_pressure_events;
+    const uint32_t backlog_age = tx_stream_count > 0
+        ? (uint32_t)(k_uptime_get() - tx_stream_backlog_since_ms) : 0U;
+    const uint32_t backlog_max = backlog_age > tx_stream_backlog_max_ms
+        ? backlog_age : tx_stream_backlog_max_ms;
 
     const uint32_t control_ring_drops = tx_control_drop_count;
 
@@ -2724,7 +2782,13 @@ int gateway_interface_send_transport_stats(void)
 
         "\"active_queue_kind\":%u,"
 
-        "\"active_len\":%u}",
+        "\"active_len\":%u,"
+        "\"stream_tx_gap_ms\":%u,"
+        "\"stream_pacing_delays\":%u,"
+        "\"stream_high_water_bytes\":%u,"
+        "\"stream_pressure_events\":%u,"
+        "\"stream_backlog_age_ms\":%u,"
+        "\"stream_backlog_max_ms\":%u}",
 
         (unsigned int)control_ring_count,
 
@@ -2777,7 +2841,13 @@ int gateway_interface_send_transport_stats(void)
 
         active_queue_kind,
 
-        active_len
+        active_len,
+        (unsigned int)GATEWAY_STREAM_TX_GAP_MS,
+        (unsigned int)pacing_delays,
+        (unsigned int)stream_high_water,
+        (unsigned int)pressure_events,
+        (unsigned int)backlog_age,
+        (unsigned int)backlog_max
 
     );
 

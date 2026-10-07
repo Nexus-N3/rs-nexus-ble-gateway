@@ -21,3 +21,14 @@
 #define GATEWAY_USE_JSON_PROTOCOL          1
 #define GATEWAY_ENABLE_RAW_FRAME_FORWARD   1
 #define GATEWAY_ENABLE_GATEWAY_TIMESTAMPS  1
+
+/* Stream UART batches remain <= 258 bytes and contain only complete frames.
+ * Wait after any TX completion before starting another STREAM batch. Control
+ * bypasses this gate. 2 ms exceeds the IFMCU's 1 ms RX idle timeout; the existing
+ * 1 ms main poll resumes pending streams without sleeps in callbacks.
+ * Set to 0 for the unpaced A/B baseline. Physical UART stays at 1 Mbps.
+ */
+#ifndef GATEWAY_STREAM_TX_GAP_MS
+#define GATEWAY_STREAM_TX_GAP_MS          2U
+#endif
+#define GATEWAY_STREAM_PRESSURE_BYTES 12288U /* 75% of the 16 KiB stream ring */
