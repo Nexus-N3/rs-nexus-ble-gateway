@@ -191,13 +191,9 @@ static void process_rx_bytes(const uint8_t *buf, size_t len)
 
 
 static int tx_enqueue_bytes(
-
     tx_queue_kind_t queue_kind,
-
     const uint8_t *data,
-
     size_t len
-
 )
 
 {
@@ -303,11 +299,6 @@ static int tx_enqueue_bytes(
     }
 
     irq_unlock(key);
-
-
-
-    transport_try_start_tx();
-
     return 0;
 
 }
@@ -1818,22 +1809,11 @@ static void uart_cb(
 
         unsigned int key = irq_lock();
 
-        bool start_next = !tx_recovery_in_progress;
-
-
-
         size_t expected_len = tx_active_len;
 
-
-
-
         if (evt->data.tx.buf != tx_chunk_buf) {
-
             tx_done_buffer_pointer_mismatches++;
-
         }
-
-
 
         if (evt->data.tx.len == 0U) {
 
@@ -1841,18 +1821,11 @@ static void uart_cb(
 
         }
 
-
-
         if ((size_t)evt->data.tx.len != expected_len) {
 
             tx_done_len_mismatch_count++;
 
         }
-
-
-
-
-
 
         if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
 
@@ -1873,17 +1846,7 @@ static void uart_cb(
 
         tx_in_progress = false;
 
-
-
         irq_unlock(key);
-
-
-
-        if (start_next) {
-
-            transport_try_start_tx();
-
-        }
 
         break;
 
@@ -1894,9 +1857,6 @@ static void uart_cb(
     case UART_TX_ABORTED: {
 
         unsigned int key = irq_lock();
-
-        bool start_next = !tx_recovery_in_progress;
-
         if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
 
             tx_control_tx_aborted_count++;
@@ -1907,24 +1867,15 @@ static void uart_cb(
 
         }
 
-
-
         tx_abort_report_pending = true;
 
         tx_active_len = 0;
-
 
         tx_active_started_ms = 0;
 
         tx_in_progress = false;
 
         irq_unlock(key);
-
-        if (start_next) {
-
-            transport_try_start_tx();
-
-        }
 
         break;
 
