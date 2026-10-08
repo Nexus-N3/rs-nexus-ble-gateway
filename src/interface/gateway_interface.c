@@ -2040,33 +2040,21 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
 {
 
     if (callbacks != NULL) {
-
         g_callbacks = *callbacks;
-
     }
-
 
 
     if (!device_is_ready(uart_dev)) {
-
         return -1;
-
     }
 
-
-
     tx_control_head = 0;
-
     tx_control_tail = 0;
-
     tx_control_count = 0;
-
     tx_control_drop_count = 0;
 
     tx_stream_head = 0;
-
     tx_stream_tail = 0;
-
     tx_stream_count = 0;
 
     tx_stream_drop_count = 0;
@@ -2078,129 +2066,79 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
     tx_stream_backlog_max_ms = 0;
 
     tx_control_enqueue_success_count = 0;
-
     tx_control_enqueue_drop_count = 0;
-
     tx_stream_enqueue_success_count = 0;
-
     tx_stream_enqueue_drop_count = 0;
-
     tx_control_bytes_enqueued = 0;
-
     tx_stream_bytes_enqueued = 0;
-
     tx_control_bytes_dequeued = 0;
-
     tx_stream_bytes_dequeued = 0;
 
     tx_control_tx_done_count = 0;
-
     tx_stream_tx_done_count = 0;
 
     tx_control_tx_aborted_count = 0;
-
     tx_stream_tx_aborted_count = 0;
 
     tx_control_tx_start_failures = 0;
-
     tx_stream_tx_start_failures = 0;
 
     tx_done_len_mismatch_count = 0;
-
     tx_done_zero_len_count = 0;
 
 
-
     uart_rx_buf_a_in_use = false;
-
     uart_rx_buf_b_in_use = false;
 
     tx_in_progress = false;
-
     tx_active_queue_kind = TX_QUEUE_CONTROL;
-
     tx_active_len = 0;
-
-
     tx_active_started_ms = 0;
-
     tx_stuck_count = 0;
 
     tx_stuck_reported = false;
-
     tx_recovery_in_progress = false;
 
-
     tx_done_buffer_pointer_mismatches = 0;
-
-
 
     next_transport_stats_ms = k_uptime_get() + 10000;
 
     if (uart_callback_set(uart_dev, uart_cb, NULL) != 0) {
-
         return -1;
-
     }
-
-
 
     uint8_t *buf = claim_rx_buf();
 
     if (buf == NULL) {
-
         return -1;
-
     }
-
-
 
     if (uart_rx_enable(uart_dev, buf, UART_RX_BUF_SIZE, 5000) != 0) {
-
         return -1;
-
     }
 
-
-
     return 0;
-
 }
 
 
 
 int gateway_interface_reset_transport_state(void)
-
 {
-
     unsigned int key;
 
-
-
     if (!device_is_ready(uart_dev)) {
-
         return -1;
-
     }
-
-
 
     key = irq_lock();
 
     rx_len = 0;
-
     pending_line_ready = false;
-
     pending_line[0] = '\0';
-
     tx_control_head = 0;
-
     tx_control_tail = 0;
-
     tx_control_count = 0;
-
     tx_control_drop_count = 0;
-
     tx_stream_head = 0;
 
     tx_stream_tail = 0;
@@ -2246,8 +2184,6 @@ int gateway_interface_reset_transport_state(void)
     tx_done_len_mismatch_count = 0;
 
     tx_done_zero_len_count = 0;
-
-
 
     tx_active_queue_kind = TX_QUEUE_CONTROL;
 
@@ -2271,8 +2207,6 @@ int gateway_interface_reset_transport_state(void)
 
     next_transport_stats_ms = k_uptime_get() + 2000;
 
-
-
     return 0;
 
 }
@@ -2285,17 +2219,11 @@ int gateway_interface_poll(void)
 
     static char line[RX_LINE_MAX];
 
-
-
     int64_t now = k_uptime_get();
 
     bool recover_stuck_tx = false;
 
-
-
     unsigned int key = irq_lock();
-
-
 
     if (tx_stream_count > 0) {
         uint32_t age = (uint32_t)(now - tx_stream_backlog_since_ms);
@@ -2305,52 +2233,34 @@ int gateway_interface_poll(void)
     }
 
     if (
-
         tx_in_progress &&
-
         !tx_stuck_reported &&
-
         tx_active_started_ms > 0 &&
-
         (now - tx_active_started_ms) >= 100
-
     ) {
 
         tx_stuck_reported = true;
-
         tx_stuck_count++;
-
         tx_recovery_in_progress = true;
-
         recover_stuck_tx = true;
-
     }
-
-
 
     irq_unlock(key);
 
     if (recover_stuck_tx) {
-
         int abort_rc = uart_tx_abort(uart_dev);
-
         key = irq_lock();
-
         if (abort_rc == -EFAULT && tx_in_progress) {
-
             /* The driver confirms that no hardware TX is active. */
             tx_stream_not_before_ms = now + GATEWAY_STREAM_TX_GAP_MS;
             tx_active_len = 0;
-
             tx_active_started_ms = 0;
-
             tx_in_progress = false;
 
         } else if (tx_in_progress) {
 
             /* No completion arrived; retry after another stuck interval. */
             tx_active_started_ms = now;
-
             tx_stuck_reported = false;
 
         }
@@ -2358,7 +2268,6 @@ int gateway_interface_poll(void)
         tx_recovery_in_progress = false;
 
         irq_unlock(key);
-
     }
 
     transport_try_start_tx();
@@ -2376,72 +2285,40 @@ int gateway_interface_poll(void)
     }
 
     if (tx_abort_report_pending) {
-
         key = irq_lock();
-
         bool report_abort = tx_abort_report_pending;
-
         tx_abort_report_pending = false;
-
         irq_unlock(key);
 
-
-
         if (report_abort) {
-
             gateway_interface_send_transport_stats();
-
         }
 
     }
 
-
-
     if (!pending_line_ready) {
-
         return 0;
-
     }
-
-
 
     key = irq_lock();
 
-
-
     if (!pending_line_ready) {
-
         irq_unlock(key);
-
         return 0;
-
     }
 
-
-
     memcpy(line, pending_line, sizeof(line));
-
     pending_line_ready = false;
 
-
-
     irq_unlock(key);
-
-
 
     gateway_command_t command;
 
     parse_command_line(line, &command);
 
-
-
     if (g_callbacks.on_command != NULL) {
-
         g_callbacks.on_command(&command);
-
     }
-
-
 
     return 0;
 
