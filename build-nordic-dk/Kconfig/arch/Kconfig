@@ -1,0 +1,12 @@
+# Load Zephyr Arch Kconfig descriptions.
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/rx/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/x86/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/xtensa/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/sparc/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/riscv/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/posix/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/openrisc/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/mips/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/arm64/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/arm/Kconfig"
+osource "/home/mike/Desktop/zephyr-main/zephyr/arch/arc/Kconfig"

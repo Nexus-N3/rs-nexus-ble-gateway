@@ -1,0 +1,58 @@
+cmake:
+  application:
+    configuration-dir: '/home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr'
+    source-dir: '/home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr'
+  board:
+    name: 'nrf54l15dk'
+    path:
+     - '/home/mike/Desktop/zephyr-main/zephyr/boards/nordic/nrf54l15dk'
+    qualifiers: 'nrf54l15/cpuapp'
+    revision: ''
+  devicetree:
+    bindings-dirs:
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/bindings'
+    files:
+     - '/home/mike/Desktop/zephyr-main/zephyr/boards/nordic/nrf54l15dk/nrf54l15dk_nrf54l15_cpuapp.dts'
+     - '/home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr/nrf54l15dk.overlay'
+    include-dirs:
+     - '/home/mike/Desktop/zephyr-main/modules/hal/ambiq/dts'
+     - '/home/mike/Desktop/zephyr-main/modules/hal/atmel/include'
+     - '/home/mike/Desktop/zephyr-main/modules/hal/bouffalolab/include'
+     - '/home/mike/Desktop/zephyr-main/modules/hal/bouffalolab/include/zephyr'
+     - '/home/mike/Desktop/zephyr-main/modules/hal/ti/dts'
+     - '/home/mike/Desktop/zephyr-main/zephyr/include'
+     - '/home/mike/Desktop/zephyr-main/zephyr/include/zephyr'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/common'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/vendor'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/rx'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/x86'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/xtensa'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/sparc'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/riscv'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/posix'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/arm64'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/arm'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts/arc'
+     - '/home/mike/Desktop/zephyr-main/zephyr/dts'
+    user-files:
+     - '/home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr/nrf54l15dk.overlay'
+  kconfig:
+    files:
+     - '/home/mike/Desktop/zephyr-main/zephyr/boards/nordic/nrf54l15dk/nrf54l15dk_nrf54l15_cpuapp_defconfig'
+     - '/home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr/prj.conf'
+    user-files:
+     - '/home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr/prj.conf'
+  toolchain:
+    name: 'zephyr'
+    path: '/home/mike/zephyr-sdk-1.0.1'
+  vendor-specific:
+    nordic:
+      svdfile: '/home/mike/Desktop/zephyr-main/modules/hal/nordic/nrfx/bsp/stable/mdk/nrf54l15_application.svd'
+  zephyr:
+    version: '4.4.99'
+    zephyr-base: '/home/mike/Desktop/zephyr-main/zephyr'
+version: '0.1.0'
+west:
+  command: '/home/mike/Desktop/zephyr-main/.venv/bin/west build -p always -b nrf54l15dk/nrf54l15/cpuapp -s /home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr -d /home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/build-nordic-dk -- -DDTC_OVERLAY_FILE=/home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr/nrf54l15dk.overlay -DCMAKE_EXPORT_COMPILE_COMMANDS=ON'
+  topdir: '/home/mike/Desktop/zephyr-main'
+  version: '1.5.0'

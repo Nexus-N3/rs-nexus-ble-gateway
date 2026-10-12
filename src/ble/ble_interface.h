@@ -64,6 +64,15 @@ void ble_interface_write_cancel(int reason);
 int ble_interface_get_rssi(const char *address, int8_t *rssi_out);
 uint8_t ble_interface_active_connection_count(void);
 
+typedef struct {
+    bool ready;
+    uint8_t connected_count;
+    char connected_addresses[GATEWAY_MAX_SENSORS][GATEWAY_MAX_ADDRESS_LEN];
+} ble_connection_snapshot_t;
+
+/* Live established BLE links; excludes discovery and pending connections. */
+void ble_interface_get_connection_snapshot(ble_connection_snapshot_t *snapshot);
+
 /*
  * Optional tuning hooks. Some stacks expose these, some do not.
  */

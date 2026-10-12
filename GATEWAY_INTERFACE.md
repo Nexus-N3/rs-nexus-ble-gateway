@@ -365,10 +365,18 @@ send_json({
 Example response sequence:
 
 ```json
-{"type":"status","request_id":"status_1","gateway":{"state":"ready","backend":"stub","connected_count":0}}
+{"type":"status","request_id":"status_1","gateway":{"state":"ready","backend":"zephyr","connected_count":1,"connected_addresses":["D4:22:CD:00:11:22"]}}
 {"type":"gateway_transport_stats","control_ring_bytes":0,"stream_ring_bytes":0,"control_ring_drops":0,"stream_ring_drops":0,"control_enqueue_success":0,"control_enqueue_drops":0,"stream_enqueue_success":0,"stream_enqueue_drops":0,"control_bytes_enqueued":0,"stream_bytes_enqueued":0,"control_bytes_dequeued":0,"stream_bytes_dequeued":0,"control_tx_done":0,"stream_tx_done":0,"control_tx_aborted":0,"stream_tx_aborted":0,"control_tx_start_failures":0,"stream_tx_start_failures":0,"tx_in_progress":false,"active_queue_kind":0,"active_len":0}
 {"type":"ble_notification_rx_stats_complete","request_id":"status_1","summary_enqueued":true}
 ```
+
+`connected_addresses` lists established BLE links observed in Zephyr's live
+connection objects while handling the request. `connected_count` matches the
+length of that list. Discovery entries and connecting or disconnecting links
+are excluded. With no established links, the list is empty and the count is zero.
+The gateway reports `state: "not_ready"` before BLE initialization completes.
+This inventory describes BLE links, not the sensors' measurement state. Links
+can change during or after collection; it is not an atomic snapshot across peers.
 
 When sensor stats are available, the gateway may also emit one or more:
 

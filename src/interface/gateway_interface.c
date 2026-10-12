@@ -1,4 +1,5 @@
 #include "gateway_interface.h"
+#include "../ble/ble_interface.h"
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
@@ -201,111 +202,61 @@ static void process_rx_bytes(const uint8_t *buf, size_t len)
 static int tx_enqueue_bytes(
 
     tx_queue_kind_t queue_kind,
-
     const uint8_t *data,
-
     size_t len
 
 )
-
 {
 
     uint8_t *ring;
-
     volatile size_t *tail;
-
     volatile size_t *count;
-
     size_t ring_size;
-
     volatile uint32_t *drop_count;
 
-
-
     if (data == NULL) {
-
         return -1;
-
     }
-
-
 
     if (queue_kind == TX_QUEUE_CONTROL) {
-
         ring = tx_control_ring;
-
         tail = &tx_control_tail;
-
         count = &tx_control_count;
-
         ring_size = TX_CONTROL_RING_SIZE;
-
         drop_count = &tx_control_drop_count;
-
     } else {
-
         ring = tx_stream_ring;
-
         tail = &tx_stream_tail;
-
         count = &tx_stream_count;
-
         ring_size = TX_STREAM_RING_SIZE;
-
         drop_count = &tx_stream_drop_count;
-
     }
-
-
 
     unsigned int key = irq_lock();
 
-
-
     if ((ring_size - *count) < len) {
-
         *drop_count += 1U;
-
         if (queue_kind == TX_QUEUE_CONTROL) {
-
             tx_control_enqueue_drop_count++;
-
         } else {
-
             tx_stream_enqueue_drop_count++;
-
         }
-
         irq_unlock(key);
-
         return -12;
-
     }
-
-
 
     for (size_t i = 0; i < len; i++) {
-
         ring[*tail] = data[i];
-
         *tail = (*tail + 1U) % ring_size;
-
     }
-
-
 
     *count += len;
 
     if (queue_kind == TX_QUEUE_CONTROL) {
-
         tx_control_enqueue_success_count++;
-
         tx_control_bytes_enqueued += (uint32_t)len;
-
     } else {
-
         tx_stream_enqueue_success_count++;
-
         tx_stream_bytes_enqueued += (uint32_t)len;
         if (*count == len) {
             tx_stream_backlog_since_ms = k_uptime_get();
@@ -323,12 +274,8 @@ static int tx_enqueue_bytes(
 
     irq_unlock(key);
 
-
-
     transport_try_start_tx();
-
     return 0;
-
 }
 
 
@@ -357,22 +304,13 @@ static int transport_write_str(tx_queue_kind_t queue_kind, const char *s)
 
 }
 
-
-
 static int transport_write_bytes(
-
     tx_queue_kind_t queue_kind,
-
     const uint8_t *data,
-
     size_t len
-
 )
-
 {
-
     return tx_enqueue_bytes(queue_kind, data, len);
-
 }
 
 
@@ -659,35 +597,21 @@ static uint8_t *claim_rx_buf(void)
 
 }
 
-
-
-
-
-
 static void transport_try_start_tx(void)
 
 {
 
     int len;
 
-
-
     if (!device_is_ready(uart_dev)) {
-
         return;
-
     }
-
-
 
     unsigned int key = irq_lock();
 
     if (tx_in_progress || tx_recovery_in_progress) {
-
         irq_unlock(key);
-
         return;
-
     }
 
     if (tx_control_count == 0 && tx_stream_count > 0 &&
@@ -698,59 +622,33 @@ static void transport_try_start_tx(void)
     }
 
     tx_in_progress = true;
-
     irq_unlock(key);
 
-
-
     tx_queue_kind_t queue_kind = TX_QUEUE_CONTROL;
-
     len = tx_dequeue_into_buf(tx_chunk_buf, sizeof(tx_chunk_buf), &queue_kind);
 
     if (len <= 0) {
-
         key = irq_lock();
-
         tx_in_progress = false;
-
         irq_unlock(key);
-
         return;
-
     }
 
-
-
-
-
-
     key = irq_lock();
-
     tx_active_queue_kind = queue_kind;
-
     tx_active_len = (size_t)len;
-
-
     tx_active_started_ms = k_uptime_get();
-
     tx_stuck_reported = false;
 
     /* Keep completion callbacks masked until accepted stream bytes have
      * been accounted for. uart_tx is a nonblocking driver operation.
      */
     int rc = uart_tx(
-
         uart_dev,
-
         tx_chunk_buf,
-
         len,
-
         SYS_FOREVER_US
-
     );
-
-
 
     if (rc == 0 && queue_kind == TX_QUEUE_STREAM) {
         uint32_t age = (uint32_t)(k_uptime_get() - tx_stream_backlog_since_ms);
@@ -766,33 +664,21 @@ static void transport_try_start_tx(void)
     }
 
     if (rc != 0) {
-
         if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
-
             tx_control_tx_start_failures++;
-
         } else {
-
             tx_stream_tx_start_failures++;
-
         }
-
         tx_stream_not_before_ms =
             k_uptime_get() + GATEWAY_STREAM_TX_GAP_MS;
-
         tx_active_len = 0;
-
-
         tx_active_started_ms = 0;
-
         tx_stuck_reported = false;
-
         tx_in_progress = false;
 
     }
 
     irq_unlock(key);
-
 }
 
 
@@ -1482,241 +1368,126 @@ static void parse_command_line(const char *line, gateway_command_t *command)
 {
 
     memset(command, 0, sizeof(*command));
-
     command->type = GW_CMD_NONE;
-
-
 
     extract_request_id(line, command->request_id, sizeof(command->request_id));
 
-
-
     if (json_type_is(line, "hello")) {
-
         command->type = GW_CMD_HELLO;
-
         return;
-
     }
-
-
 
     if (json_type_is(line, "get_status")) {
-
         command->type = GW_CMD_GET_STATUS;
-
         return;
-
     }
-
-
 
     if (json_type_is(line, "reset_session")) {
-
         command->type = GW_CMD_RESET_SESSION;
-
         return;
-
     }
-
-
 
     if (json_type_is(line, "scan_start")) {
-
         command->type = GW_CMD_SCAN_START;
-
         command->timeout_ms = extract_uint32_field(
-
             line,
-
             "timeout_ms",
-
             5000
-
         );
-
         return;
-
     }
-
-
 
     if (json_type_is(line, "scan_stop")) {
-
         command->type = GW_CMD_SCAN_STOP;
-
         return;
-
     }
-
-
 
     if (json_type_is(line, "connect_addresses")) {
-
         command->type = GW_CMD_CONNECT_ADDRESSES;
 
-
-
         extract_address_array(
-
             line,
-
             "addresses",
-
             command->addresses,
-
             &command->address_count,
-
             GATEWAY_MAX_SENSORS
-
         );
-
-
 
         command->sensor_count = command->address_count;
-
-
-
         for (uint8_t i = 0; i < command->address_count; i++) {
-
             strncpy(
-
                 command->sensors[i].address,
-
                 command->addresses[i],
-
                 sizeof(command->sensors[i].address) - 1
-
             );
-
         }
 
-
-
         return;
-
     }
-
-
 
     if (json_type_is(line, "disconnect_addresses")) {
-
         command->type = GW_CMD_DISCONNECT_ADDRESSES;
 
-
-
         extract_address_array(
-
             line,
-
             "addresses",
-
             command->addresses,
-
             &command->address_count,
-
             GATEWAY_MAX_SENSORS
-
         );
 
-
-
         return;
-
     }
-
-
 
     if (json_type_is(line, "disconnect_all")) {
-
         command->type = GW_CMD_DISCONNECT_ALL;
-
         return;
-
     }
-
-
 
     if (json_type_is(line, "subscribe")) {
-
         command->type = GW_CMD_SUBSCRIBE;
-
         extract_string_field(
-
             line,
-
             "address",
-
             command->address,
-
             sizeof(command->address)
-
         );
-
         extract_string_field(
-
             line,
-
             "characteristic_uuid",
-
             command->characteristic_uuid,
-
             sizeof(command->characteristic_uuid)
-
         );
-
         command->binary_notifications = extract_bool_field(
-
             line,
-
             "binary_notifications",
-
             false
-
         );
-
-
 
         command->indicate = extract_bool_field(
-
             line,
-
             "indicate",
-
             false
-
         );
 
         return;
 
     }
 
-
-
     if (json_type_is(line, "unsubscribe")) {
-
         command->type = GW_CMD_UNSUBSCRIBE;
 
         extract_string_field(
-
             line,
-
             "address",
-
             command->address,
-
             sizeof(command->address)
-
         );
 
         extract_string_field(
-
             line,
-
             "characteristic_uuid",
-
             command->characteristic_uuid,
-
             sizeof(command->characteristic_uuid)
 
         );
@@ -1725,92 +1496,55 @@ static void parse_command_line(const char *line, gateway_command_t *command)
 
     }
 
-
-
     if (json_type_is(line, "gatt_write")) {
-
         command->type = GW_CMD_GATT_WRITE;
-
         extract_string_field(
-
             line,
-
             "address",
-
             command->address,
-
             sizeof(command->address)
-
         );
 
         extract_string_field(
-
             line,
-
             "characteristic_uuid",
-
             command->characteristic_uuid,
-
             sizeof(command->characteristic_uuid)
-
         );
 
         command->without_response = extract_bool_field(
-
             line,
-
             "without_response",
-
             false
 
         );
 
         extract_hex_payload_field(
-
             line,
-
             "payload_hex",
-
             command->payload,
-
             &command->payload_len,
-
             sizeof(command->payload)
-
         );
 
         return;
-
     }
-
-
 
     if (json_type_is(line, "gatt_read")) {
 
         command->type = GW_CMD_GATT_READ;
-
         extract_string_field(
-
             line,
-
             "address",
-
             command->address,
-
             sizeof(command->address)
-
         );
 
         extract_string_field(
-
             line,
-
             "characteristic_uuid",
-
             command->characteristic_uuid,
-
             sizeof(command->characteristic_uuid)
-
         );
 
         return;
@@ -2454,69 +2188,51 @@ int gateway_interface_send_hello_ack(const char *request_id)
 
 
 int gateway_interface_send_status(const char *request_id)
-
 {
+    ble_connection_snapshot_t snapshot;
+    char addresses[2 + GATEWAY_MAX_SENSORS * (GATEWAY_MAX_ADDRESS_LEN + 3)];
+    char line[256 + sizeof(addresses)];
+    size_t offset = 0;
 
-    char line[256];
-
-
-
-    if (request_id != NULL && request_id[0] != '\0') {
-
-        snprintf(
-
-            line,
-
-            sizeof(line),
-
-            "{\"type\":\"status\","
-
-            "\"request_id\":\"%s\","
-
-            "\"gateway\":{"
-
-            "\"state\":\"ready\","
-
-            "\"backend\":\"stub\","
-
-            "\"connected_count\":0"
-
-            "}}",
-
-            request_id
-
+    ble_interface_get_connection_snapshot(&snapshot);
+    addresses[offset++] = '[';
+    for (uint8_t i = 0; i < snapshot.connected_count; i++) {
+        int written = snprintf(
+            addresses + offset, sizeof(addresses) - offset,
+            "%s\"%s\"", i == 0 ? "" : ",", snapshot.connected_addresses[i]
         );
-
-    } else {
-
-        snprintf(
-
-            line,
-
-            sizeof(line),
-
-            "{\"type\":\"status\","
-
-            "\"gateway\":{"
-
-            "\"state\":\"ready\","
-
-            "\"backend\":\"stub\","
-
-            "\"connected_count\":0"
-
-            "}}"
-
-        );
-
+        if (written < 0 || (size_t)written >= sizeof(addresses) - offset) {
+            return -ENOSPC;
+        }
+        offset += (size_t)written;
     }
+    addresses[offset++] = ']';
+    addresses[offset] = '\0';
 
-
-
+    const char *state = snapshot.ready ? "ready" : "not_ready";
+    int written;
+    if (request_id != NULL && request_id[0] != '\0') {
+        written = snprintf(
+            line, sizeof(line),
+            "{\"type\":\"status\",\"request_id\":\"%s\","
+            "\"gateway\":{\"state\":\"%s\",\"backend\":\"zephyr\","
+            "\"connected_count\":%u,\"connected_addresses\":%s}}",
+            request_id, state, (unsigned int)snapshot.connected_count, addresses
+        );
+    } else {
+        written = snprintf(
+            line, sizeof(line),
+            "{\"type\":\"status\","
+            "\"gateway\":{\"state\":\"%s\",\"backend\":\"zephyr\","
+            "\"connected_count\":%u,\"connected_addresses\":%s}}",
+            state, (unsigned int)snapshot.connected_count, addresses
+        );
+    }
+    if (written < 0 || (size_t)written >= sizeof(line)) {
+        return -ENOSPC;
+    }
     return gateway_interface_send_json_line(line);
-
 }
-
 
 
 int gateway_interface_send_transport_stats(void)
@@ -2896,82 +2612,44 @@ int gateway_interface_send_json_line(const char *json)
 
 }
 
-
-
 int gateway_interface_send_stream_frame(
-
     uint8_t sensor_id,
-
     const uint8_t *payload,
-
     uint16_t payload_len,
-
     uint64_t gateway_timestamp_us
-
 )
-
 {
-
     uint8_t frame[13 + GATEWAY_MAX_FRAME_PAYLOAD + 1];
-
     size_t index = 0;
-
     uint8_t checksum = 0;
 
-
-
     if (payload == NULL) {
-
         return -1;
-
     }
-
-
 
     if (payload_len > GATEWAY_MAX_FRAME_PAYLOAD) {
-
         payload_len = GATEWAY_MAX_FRAME_PAYLOAD;
-
     }
-
 
 
     frame[index++] = 0xA5;
-
     frame[index++] = 0x5A;
-
     frame[index++] = 0x01;
-
     frame[index++] = sensor_id;
 
-
-
     for (int i = 0; i < 8; i++) {
-
         frame[index++] = (uint8_t)((gateway_timestamp_us >> (8 * i)) & 0xFF);
-
     }
-
-
 
     frame[index++] = (uint8_t)payload_len;
-
     memcpy(&frame[index], payload, payload_len);
-
     index += payload_len;
 
-
-
     for (size_t i = 2; i < index; i++) {
-
         checksum = (uint8_t)(checksum + frame[i]);
-
     }
 
-
-
     frame[index++] = checksum;
-
     return transport_write_bytes(TX_QUEUE_STREAM, frame, index);
 
 }

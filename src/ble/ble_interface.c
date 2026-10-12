@@ -1311,6 +1311,7 @@ static uint8_t notify_cb(
 {
     gatt_subscribe_ctx_t *ctx =
         CONTAINER_OF(params, gatt_subscribe_ctx_t, params);
+        
     uint32_t receive_sequence;
 
     ARG_UNUSED(conn);
@@ -1883,6 +1884,38 @@ uint8_t ble_interface_active_connection_count(void)
     }
 
     return count;
+}
+
+static void snapshot_connected_peer(struct bt_conn *conn, void *user_data)
+{
+    ble_connection_snapshot_t *snapshot = user_data;
+    struct bt_conn_info info;
+
+    if (bt_conn_get_info(conn, &info) != 0 ||
+        info.state != BT_CONN_STATE_CONNECTED ||
+        snapshot->connected_count >= GATEWAY_MAX_SENSORS) {
+        return;
+    }
+
+    format_address(
+        bt_conn_get_dst(conn),
+        snapshot->connected_addresses[snapshot->connected_count],
+        GATEWAY_MAX_ADDRESS_LEN
+    );
+    snapshot->connected_count++;
+}
+
+void ble_interface_get_connection_snapshot(ble_connection_snapshot_t *snapshot)
+{
+    BUILD_ASSERT(CONFIG_BT_MAX_CONN <= GATEWAY_MAX_SENSORS,
+                 "Connection inventory must fit every BLE link");
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->ready = g_ble_ready;
+    if (snapshot->ready) {
+        /* Zephyr retains each connection during its callback. Do not rely on
+         * the scheduler or adapter's potentially stale connection records. */
+        bt_conn_foreach(BT_CONN_TYPE_LE, snapshot_connected_peer, snapshot);
+    }
 }
 
 int ble_interface_request_connection_params(

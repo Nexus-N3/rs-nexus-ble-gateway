@@ -1,0 +1,8 @@
+west:
+  command: /home/mike/Desktop/zephyr-main/.venv/bin/west build -p always -b nrf54l15dk/nrf54l15/cpuapp
+    -s /home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr
+    -d /home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/build-nordic-dk
+    -- -DDTC_OVERLAY_FILE=/home/mike/Desktop/apps/dev/rs-nexus-project/rs-nexus-ble-gateway/ports/zephyr/nrf54l15dk.overlay
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+  topdir: /home/mike/Desktop/zephyr-main
+  version: 1.5.0

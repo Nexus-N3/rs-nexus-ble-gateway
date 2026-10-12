@@ -1,0 +1,10 @@
+/ {
+    chosen {
+        zephyr,console = &uart30;
+    };
+};
+
+&uart30 {
+    status = "okay";
+    current-speed = <1000000>;
+};

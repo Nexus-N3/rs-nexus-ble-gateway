@@ -2,7 +2,7 @@
 
 #define GATEWAY_MAX_SENSORS              10
 #define GATEWAY_MAX_SENSOR_TYPES          4
-#define GATEWAY_MAX_FRAME_PAYLOAD       244
+#define GATEWAY_MAX_FRAME_PAYLOAD       244  //For an ATT MTU of 247 -> 247 - 3 = 244 bytes
 #define GATEWAY_MAX_ADDRESS_LEN          18
 #define GATEWAY_MAX_REQUEST_ID_LEN       64
 #define GATEWAY_MAX_UUID_LEN             40
