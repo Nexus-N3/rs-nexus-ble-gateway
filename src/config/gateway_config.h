@@ -26,7 +26,7 @@
  * Wait after any TX completion before starting another STREAM batch. Control
  * bypasses this gate. 2 ms exceeds the IFMCU's 1 ms RX idle timeout; the existing
  * 1 ms main poll resumes pending streams without sleeps in callbacks.
- * Set to 0 for the unpaced A/B baseline. Physical UART stays at 1 Mbps.
+ * Set to 0U for the unpaced A/B baseline. Physical UART stays at 1 Mbps.
  */
 #ifndef GATEWAY_STREAM_TX_GAP_MS
 #define GATEWAY_STREAM_TX_GAP_MS          2U

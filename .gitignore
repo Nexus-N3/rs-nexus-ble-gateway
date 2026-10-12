@@ -18,6 +18,7 @@ env.sh
 # Zephyr / west build outputs
 build/
 build_*/
+build-*/
 out/
 twister-out/
 ports/zephyr/build/
