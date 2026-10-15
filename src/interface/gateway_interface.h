@@ -16,6 +16,7 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks);
 int gateway_interface_poll(void);
 int gateway_interface_reset_transport_state(void);
 
+// generic to send defined event payload
 int gateway_interface_send_event(const gateway_event_t *event);
 int gateway_interface_send_frame(const gateway_sensor_frame_t *frame);
 int gateway_interface_send_log(const char *message);
@@ -42,6 +43,7 @@ int gateway_interface_send_not_implemented(
 /*
  * Temporary debug/helper API for JSON-lines prototype.
  * Production should move to structured event serialization or binary framing.
+ * currently this is working well and no need to change
  */
 int gateway_interface_send_json_line(const char *json);
 int gateway_interface_send_stream_frame(
