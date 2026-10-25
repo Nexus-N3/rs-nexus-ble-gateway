@@ -18,7 +18,8 @@
 #define GATEWAY_ENABLE_GATT_DEBUG 0
 #endif
 
-#define BLE_MAX_DISCOVERED_PEERS 32
+// this is too small in congested environments. increase from 32 to 64 for testing
+#define BLE_MAX_DISCOVERED_PEERS 64
 
 // ble scheduling parameters
 
@@ -1065,6 +1066,7 @@ static void device_found(
         return;
     }
 
+    // this adds any device to the know peer array and fills it up. 
     known_peer_t *peer = upsert_known_peer(addr);
     if (peer == NULL) {
         return;
