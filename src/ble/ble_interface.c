@@ -985,6 +985,32 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
+    // report the connection parameters to the gateway interface
+    struct bt_conn_info info;
+    int info_rc = bt_conn_get_info(conn, &info);
+
+    if (info_rc == 0 && info.type == BT_CONN_TYPE_LE) {
+        char line[224];
+
+        snprintf(
+            line,
+            sizeof(line),
+            "{\"type\":\"conn_param_initial\","
+            "\"address\":\"%s\","
+            "\"interval_units\":%u,"
+            "\"interval_ms_x100\":%u,"
+            "\"latency\":%u,"
+            "\"timeout_units\":%u}",
+            address,
+            (unsigned int)info.le.interval,
+            (unsigned int)(info.le.interval * 125U),
+            (unsigned int)info.le.latency,
+            (unsigned int)info.le.timeout
+        );
+
+        gateway_interface_send_json_line(line);
+    }
+
     if (entry == NULL) {
         finalize_connected(conn);
         return;
