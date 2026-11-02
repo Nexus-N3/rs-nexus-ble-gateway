@@ -1003,8 +1003,8 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
             "\"latency\":%u,"
             "\"timeout_units\":%u}",
             address,
-            (unsigned int)info.le.interval,
-            (unsigned int)(info.le.interval * 125U),
+            (unsigned int)info.le.interval_us,
+            (unsigned int)(info.le.interval_us * 125U),
             (unsigned int)info.le.latency,
             (unsigned int)info.le.timeout
         );
