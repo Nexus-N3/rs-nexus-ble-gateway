@@ -986,6 +986,32 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
+    // report the connection parameters to the gateway interface
+    struct bt_conn_info info;
+    int info_rc = bt_conn_get_info(conn, &info);
+
+    if (info_rc == 0 && info.type == BT_CONN_TYPE_LE) {
+        char line[224];
+
+        snprintf(
+            line,
+            sizeof(line),
+            "{\"type\":\"conn_param_initial\","
+            "\"address\":\"%s\","
+            "\"interval_units\":%u,"
+            "\"interval_ms_x100\":%u,"
+            "\"latency\":%u,"
+            "\"timeout_units\":%u}",
+            address,
+            (unsigned int)info.le.interval,
+            (unsigned int)(info.le.interval * 125U),
+            (unsigned int)info.le.latency,
+            (unsigned int)info.le.timeout
+        );
+
+        gateway_interface_send_json_line(line);
+    }
+
     if (entry == NULL) {
         finalize_connected(conn);
         return;
@@ -1127,7 +1153,7 @@ int ble_interface_init(const ble_interface_callbacks_t *callbacks)
     return 0;
 }
 
-int ble_interface_start_scan(uint32_t timeout_ms)
+int ble_interface_start_scan(uint32_t timeout_ms, bool allow_duplicates)
 {
     ARG_UNUSED(timeout_ms);
 
@@ -1143,7 +1169,7 @@ int ble_interface_start_scan(uint32_t timeout_ms)
 
     struct bt_le_scan_param scan_param = {
         .type = BT_LE_SCAN_TYPE_ACTIVE, 
-        .options = BT_LE_SCAN_OPT_FILTER_DUPLICATE,
+        .options = allow_duplicates ? 0 : BT_LE_SCAN_OPT_FILTER_DUPLICATE,
         .interval = BT_GAP_SCAN_FAST_INTERVAL,
         .window = BT_GAP_SCAN_FAST_WINDOW,
     };

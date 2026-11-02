@@ -31,6 +31,10 @@ typedef struct {
 int ble_scheduler_init(void);
 
 int ble_scheduler_start_scan(const char *request_id, uint32_t timeout_ms);
+int ble_scheduler_start_rf_survey_scan(
+    const char *request_id,
+    uint32_t timeout_ms
+);
 int ble_scheduler_stop_scan(void);
 int is_scan_active(void);
 int ble_scheduler_connect_addresses(
