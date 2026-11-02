@@ -275,8 +275,6 @@ static void update_notification_rx_stats(
     stats->last_gateway_timestamp_us = gateway_time_us;
 }
 
-
-
 static gateway_sensor_t *find_sensor_by_address(const char *address)
 {
     for (uint8_t i = 0; i < g_sensor_count; i++) {
@@ -1294,6 +1292,7 @@ void ble_scheduler_tick(void)
 
     flush_notification_queue(NOTIFICATION_FLUSH_BUDGET);
 }
+
 
 #define BLE_RX_STATS_LINE_MAX 1024
 

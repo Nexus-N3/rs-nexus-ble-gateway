@@ -5,7 +5,7 @@ source "$(dirname "$0")/env.sh"
 
 cd "$ZEPHYR_WORKSPACE"
 
-# Nordic DK target, not used:
+# Nordic DK target, already supported and included in zephyr
 # nrf54l15dk/nrf54l15/cpuapp
 
 west build -p always \
@@ -15,3 +15,4 @@ west build -p always \
   -- \
   -DBOARD_ROOT="$HOME/Desktop/nrf54l15-connectkit" \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
