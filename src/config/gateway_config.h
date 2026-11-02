@@ -30,5 +30,5 @@
  * Set to 0U for the unpaced A/B baseline. Physical UART stays at 1 Mbps.
  */
 
-#define GATEWAY_STREAM_TX_GAP_MS          2U
+#define GATEWAY_STREAM_TX_GAP_MS          0U
 #define GATEWAY_STREAM_PRESSURE_BYTES 12288U /* 75% of the 16 KiB stream ring */
