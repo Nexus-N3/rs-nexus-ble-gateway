@@ -88,3 +88,4 @@ void ble_scheduler_on_notification(
     uint32_t receive_sequence
 );
 void ble_scheduler_report_notification_rx_stats(const char *request_id);
+

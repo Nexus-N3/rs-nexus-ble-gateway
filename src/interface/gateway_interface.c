@@ -12,7 +12,6 @@
 
 #include "../hardware/led.h"
 
-
 #define TX_CONTROL_CHUNK_SIZE 256U
 #define TX_CHUNK_SIZE (14U + GATEWAY_MAX_FRAME_PAYLOAD)
 #define RX_LINE_MAX 512 //do not increase this 1024 squashes connect on 9 sensors and drain on lower than 9
@@ -42,89 +41,48 @@ static bool uart_rx_buf_b_in_use;
 static uint8_t tx_control_ring[TX_CONTROL_RING_SIZE];
 
 static volatile size_t tx_control_head;
-
 static volatile size_t tx_control_tail;
-
 static volatile size_t tx_control_count;
-
 static volatile uint32_t tx_control_drop_count;
-
-
 
 static uint8_t tx_stream_ring[TX_STREAM_RING_SIZE];
 
 static volatile size_t tx_stream_head;
-
 static volatile size_t tx_stream_tail;
-
 static volatile size_t tx_stream_count;
-
 static volatile uint32_t tx_stream_drop_count;
-
 static volatile uint32_t tx_control_enqueue_success_count;
-
 static volatile uint32_t tx_control_enqueue_drop_count;
-
 static volatile uint32_t tx_stream_enqueue_success_count;
-
 static volatile uint32_t tx_stream_enqueue_drop_count;
-
 static volatile uint32_t tx_control_bytes_enqueued;
-
 static volatile uint32_t tx_stream_bytes_enqueued;
-
 static volatile uint32_t tx_control_bytes_dequeued;
-
 static volatile uint32_t tx_stream_bytes_dequeued;
-
 static volatile uint32_t tx_control_tx_done_count;
-
 static volatile uint32_t tx_stream_tx_done_count;
-
 static volatile uint32_t tx_control_tx_aborted_count;
-
 static volatile uint32_t tx_stream_tx_aborted_count;
-
 static volatile uint32_t tx_control_tx_start_failures;
-
 static volatile uint32_t tx_stream_tx_start_failures;
-
 static volatile uint32_t tx_done_len_mismatch_count;
-
 static volatile uint32_t tx_done_zero_len_count;
-
-
-
 static volatile bool tx_abort_report_pending;
 
-
-
 typedef enum {
-
     TX_QUEUE_CONTROL = 0,
-
     TX_QUEUE_STREAM,
-
 } tx_queue_kind_t;
 
 
-
 static uint8_t tx_chunk_buf[TX_CHUNK_SIZE];
-
 static volatile bool tx_in_progress;
-
 static volatile tx_queue_kind_t tx_active_queue_kind;
-
 static volatile size_t tx_active_len;
-
 static volatile int64_t tx_active_started_ms;
-
 static volatile uint32_t tx_stuck_count;
-
 static volatile bool tx_stuck_reported;
-
 static volatile bool tx_recovery_in_progress;
-
 static volatile uint32_t tx_done_buffer_pointer_mismatches;
 
 /* All fields below are protected by irq_lock, like the TX rings. */
@@ -139,65 +97,35 @@ static int64_t next_transport_stats_ms;
 
 static void transport_try_start_tx(void);
 
-
-
 static void process_rx_bytes(const uint8_t *buf, size_t len)
-
 {
 
     for (size_t i = 0; i < len; i++) {
-
         unsigned char c = buf[i];
 
-
-
         if (c == '\r') {
-
             continue;
-
         }
-
-
 
         if (c == '\n') {
-
             rx_line[rx_len] = '\0';
 
-
-
             if (rx_len > 0 && !pending_line_ready) {
-
                 memcpy(pending_line, rx_line, rx_len + 1);
-
                 pending_line_ready = true;
-
             }
 
-
-
             rx_len = 0;
-
             continue;
-
         }
-
-
 
         if (rx_len < RX_LINE_MAX - 1) {
-
             rx_line[rx_len++] = (char)c;
-
         } else {
-
             rx_len = 0;
-
         }
-
     }
-
 }
-
-
 
 static int tx_enqueue_bytes(
 
@@ -1553,16 +1481,11 @@ static void parse_command_line(const char *line, gateway_command_t *command)
 
 }
 
-
-
 static void uart_cb(
 
     const struct device *dev,
-
     struct uart_event *evt,
-
     void *user_data
-
 )
 
 {
@@ -1952,11 +1875,8 @@ int gateway_interface_poll(void)
 {
 
     static char line[RX_LINE_MAX];
-
     int64_t now = k_uptime_get();
-
     bool recover_stuck_tx = false;
-
     unsigned int key = irq_lock();
 
     if (tx_stream_count > 0) {
@@ -2048,8 +1968,9 @@ int gateway_interface_poll(void)
 
     gateway_command_t command;
 
+    // Parse the command line into a structured command object
     parse_command_line(line, &command);
-
+    //put the command on the on_command callback
     if (g_callbacks.on_command != NULL) {
         g_callbacks.on_command(&command);
     }

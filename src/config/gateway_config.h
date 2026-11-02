@@ -28,7 +28,6 @@
  * 1 ms main poll resumes pending streams without sleeps in callbacks.
  * Set to 0U for the unpaced A/B baseline. Physical UART stays at 1 Mbps.
  */
-#ifndef GATEWAY_STREAM_TX_GAP_MS
+
 #define GATEWAY_STREAM_TX_GAP_MS          2U
-#endif
 #define GATEWAY_STREAM_PRESSURE_BYTES 12288U /* 75% of the 16 KiB stream ring */
