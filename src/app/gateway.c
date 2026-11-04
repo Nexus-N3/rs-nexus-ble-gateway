@@ -18,7 +18,7 @@ static const char *request_id_or_null(const gateway_command_t *command)
     return command->request_id;
 }
 
-// button press callback 
+// app level button press callback 
 static void on_gateway_button_event(
     button_event_t event,
     int64_t timestamp_ms
@@ -324,7 +324,8 @@ static void on_gateway_command(const gateway_command_t *command)
 
 static void on_ble_sensor_found(const ble_discovered_sensor_t *sensor)
 {
-    rf_survey_on_sensor_found(sensor);  //we should only do that if the survey is active?
+    // the rf_survey returns early if the survey is not active, so this is safe to call here
+    rf_survey_on_sensor_found(sensor);  
     ble_scheduler_on_sensor_found(sensor);
 
 }

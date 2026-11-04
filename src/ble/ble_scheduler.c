@@ -80,9 +80,10 @@ enum gatt_worker_state {
 };
 
 K_THREAD_STACK_DEFINE(g_gatt_worker_stack, 2048);
-static struct k_work_q g_gatt_worker_queue;
+static struct k_work_q g_gatt_worker_queue;  //define a work queue for GATT operations that may block, such as read and subscribe. This allows the main scheduler to remain responsive while waiting for these operations to complete.
 static struct k_work g_gatt_worker;
-static atomic_t g_gatt_worker_state;
+
+static atomic_t g_gatt_worker_state;  //lock free, atomic variable to track the state of the GATT worker
 static int g_gatt_worker_result;
 static uint8_t g_gatt_worker_read_data[GATEWAY_MAX_FRAME_PAYLOAD];
 static size_t g_gatt_worker_read_len;
@@ -508,6 +509,7 @@ static int start_next_connect(void)
 
 int ble_scheduler_init(void)
 {
+    // Initialize the GATT worker queue and work item
     k_work_queue_start(
         &g_gatt_worker_queue,
         g_gatt_worker_stack,
@@ -517,6 +519,8 @@ int ble_scheduler_init(void)
     );
     k_work_init(&g_gatt_worker, run_blocking_gatt_op);
     atomic_set(&g_gatt_worker_state, GATT_WORKER_IDLE);
+
+
     memset(g_notification_rx_stats, 0, sizeof(g_notification_rx_stats));
     memset(g_sensors, 0, sizeof(g_sensors));
     memset(&g_pending_gatt_op, 0, sizeof(g_pending_gatt_op));
@@ -993,6 +997,7 @@ static void flush_notification_queue(uint8_t budget)
     }
 }
 
+// called from the main loop to process pending operations and handle timeouts
 void ble_scheduler_tick(void)
 {
     bool handled_gatt_op = false;
@@ -1075,6 +1080,7 @@ void ble_scheduler_tick(void)
         return;
     }
 
+    // stop scan if the deadline has passed
     if (g_scan_active && k_uptime_get() >= g_scan_deadline_ms) {
         ble_scheduler_stop_scan();
     }
@@ -1083,6 +1089,7 @@ void ble_scheduler_tick(void)
         g_active_connect_address[0] != '\0' &&
         g_connect_deadline_ms > 0 &&
         k_uptime_get() >= g_connect_deadline_ms) {
+
         char timed_out_address[GATEWAY_MAX_ADDRESS_LEN];
 
         strncpy(
