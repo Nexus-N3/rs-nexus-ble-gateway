@@ -372,6 +372,7 @@ int gateway_app_init(void)
         .on_notification = on_ble_notification,
     };
 
+    // initalises the callbacks and the transport layer (uart) for the gateway interface
     rc = gateway_interface_init(&interface_callbacks);
     if (rc != 0) {
         return rc;
@@ -398,6 +399,8 @@ int gateway_app_init(void)
     return 0;
 }
 
+// called every 1ms from the main loop, this function will poll the gateway interface for any new commands, 
+// tick the BLE scheduler and tick the RF survey module.
 void gateway_app_run_once(void)
 {
     gateway_interface_poll();

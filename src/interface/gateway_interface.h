@@ -1,8 +1,6 @@
 #pragma once
 
 #include <stdint.h>
-#include <stddef.h>
-#include <stdbool.h>
 
 #include "gateway_protocol.h"
 
@@ -16,9 +14,6 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks);
 int gateway_interface_poll(void);
 int gateway_interface_reset_transport_state(void);
 
-// generic to send defined event payload
-int gateway_interface_send_event(const gateway_event_t *event);
-int gateway_interface_send_frame(const gateway_sensor_frame_t *frame);
 int gateway_interface_send_log(const char *message);
 
 /*

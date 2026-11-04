@@ -10,12 +10,12 @@
 #include <stdlib.h>
 #include <errno.h>
 
-#include "../hardware/led.h"
-
 #define TX_CONTROL_CHUNK_SIZE 256U
 #define TX_CHUNK_SIZE (14U + GATEWAY_MAX_FRAME_PAYLOAD)
 #define RX_LINE_MAX 512 //do not increase this 1024 squashes connect on 9 sensors and drain on lower than 9
 #define UART_RX_BUF_SIZE 256
+
+// TX UART buffers
 #define TX_CONTROL_RING_SIZE 8192
 #define TX_STREAM_RING_SIZE 16384
 
@@ -23,15 +23,18 @@
 static const struct device *uart_dev =
     DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 
-
 static gateway_interface_callbacks_t g_callbacks;
 
+// acumulated UART RX bytes, until a line is ready to be processed
 static char rx_line[RX_LINE_MAX];
 static size_t rx_len;
-static char pending_line[RX_LINE_MAX];
 
+// pending UART RX line, ready to be sent to the gateway command parser
+static char pending_line[RX_LINE_MAX];
 static volatile bool pending_line_ready;
 
+
+// two buffers for UART RX, to allow the UART driver to continue receiving while the other buffer is being processed
 static uint8_t uart_rx_buf_a[UART_RX_BUF_SIZE];
 static uint8_t uart_rx_buf_b[UART_RX_BUF_SIZE];
 
@@ -92,7 +95,6 @@ static size_t tx_stream_high_water_bytes;
 static uint32_t tx_stream_pressure_events;
 static int64_t tx_stream_backlog_since_ms;
 static uint32_t tx_stream_backlog_max_ms;
-
 static int64_t next_transport_stats_ms;
 
 static void transport_try_start_tx(void);
@@ -101,13 +103,17 @@ static void process_rx_bytes(const uint8_t *buf, size_t len)
 {
 
     for (size_t i = 0; i < len; i++) {
+        // take the incoming character byte
         unsigned char c = buf[i];
 
+        //if the character is a carriage return, ignore it and continue to the next character
         if (c == '\r') {
             continue;
         }
 
+        //if the character is a newline, terminate the string and mark the line as ready to be processed
         if (c == '\n') {
+            // terminate the string with(\0) 
             rx_line[rx_len] = '\0';
 
             if (rx_len > 0 && !pending_line_ready) {
@@ -475,62 +481,37 @@ static int tx_dequeue_into_buf(
 
 }
 
-
-
-
-
 static void mark_rx_buf_free(const uint8_t *buf)
-
 {
-
     if (buf == uart_rx_buf_a) {
-
         uart_rx_buf_a_in_use = false;
 
     } else if (buf == uart_rx_buf_b) {
-
         uart_rx_buf_b_in_use = false;
-
     }
-
 }
 
 
-
+// this is just a marking to keep tracking of what buffer is in use.
 static uint8_t *claim_rx_buf(void)
-
 {
 
     if (!uart_rx_buf_a_in_use) {
-
         uart_rx_buf_a_in_use = true;
-
         return uart_rx_buf_a;
-
     }
-
-
 
     if (!uart_rx_buf_b_in_use) {
-
         uart_rx_buf_b_in_use = true;
-
         return uart_rx_buf_b;
-
     }
 
-
-
     return NULL;
-
 }
 
 static void transport_try_start_tx(void)
-
 {
-
     int len;
-
     if (!device_is_ready(uart_dev)) {
         return;
     }
@@ -1139,29 +1120,17 @@ static void extract_request_id(const char *line, char *out, size_t out_size)
 
 }
 
-
-
 static int json_type_is(const char *line, const char *type)
-
 {
-
     char compact[64];
-
     char spaced[64];
 
-
-
     snprintf(compact, sizeof(compact), "\"type\":\"%s\"", type);
-
     snprintf(spaced, sizeof(spaced), "\"type\": \"%s\"", type);
 
-
-
+    //returns 1 or 0 if the patten exists or not. 
     return strstr(line, compact) != NULL || strstr(line, spaced) != NULL;
-
 }
-
-
 
 static void extract_address_array(
 
@@ -1287,14 +1256,8 @@ static void extract_address_array(
 
 }
 
-
-
-//
-
 static void parse_command_line(const char *line, gateway_command_t *command)
-
 {
-
     memset(command, 0, sizeof(*command));
     command->type = GW_CMD_NONE;
 
@@ -1529,212 +1492,111 @@ static void parse_command_line(const char *line, gateway_command_t *command)
 }
 
 static void uart_cb(
-
     const struct device *dev,
     struct uart_event *evt,
     void *user_data
 )
-
 {
-
     ARG_UNUSED(user_data);
 
-
-
     switch (evt->type) {
-
     case UART_TX_DONE: {
-
         unsigned int key = irq_lock();
-
         bool start_next = !tx_recovery_in_progress;
-
-
-
         size_t expected_len = tx_active_len;
 
-
-
-
         if (evt->data.tx.buf != tx_chunk_buf) {
-
             tx_done_buffer_pointer_mismatches++;
-
         }
-
-
 
         if (evt->data.tx.len == 0U) {
-
             tx_done_zero_len_count++;
-
         }
-
-
 
         if ((size_t)evt->data.tx.len != expected_len) {
-
             tx_done_len_mismatch_count++;
-
         }
-
-
-
-
-
 
         if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
-
             tx_control_tx_done_count++;
-
         } else {
-
             tx_stream_tx_done_count++;
-
         }
-
-
 
         tx_stream_not_before_ms =
             k_uptime_get() + GATEWAY_STREAM_TX_GAP_MS;
-
         tx_active_len = 0;
 
-
         tx_active_started_ms = 0;
-
         tx_in_progress = false;
-
-
 
         irq_unlock(key);
 
-
-
         if (start_next) {
-
             transport_try_start_tx();
-
         }
-
         break;
-
     }
 
-
-
     case UART_TX_ABORTED: {
-
         unsigned int key = irq_lock();
-
         bool start_next = !tx_recovery_in_progress;
 
         if (tx_active_queue_kind == TX_QUEUE_CONTROL) {
-
             tx_control_tx_aborted_count++;
-
         } else {
-
             tx_stream_tx_aborted_count++;
-
         }
-
-
 
         tx_abort_report_pending = true;
 
         tx_stream_not_before_ms =
             k_uptime_get() + GATEWAY_STREAM_TX_GAP_MS;
-
         tx_active_len = 0;
-
-
         tx_active_started_ms = 0;
-
         tx_in_progress = false;
 
         irq_unlock(key);
-
         if (start_next) {
-
             transport_try_start_tx();
-
         }
-
         break;
-
     }
-
-
 
     case UART_RX_RDY:
-
         process_rx_bytes(
-
             &evt->data.rx.buf[evt->data.rx.offset],
-
             evt->data.rx.len
-
         );
-
         break;
-
-
 
     case UART_RX_BUF_REQUEST: {
-
         uint8_t *buf = claim_rx_buf();
-
         if (buf != NULL) {
-
             (void)uart_rx_buf_rsp(dev, buf, UART_RX_BUF_SIZE);
-
         }
-
         break;
-
     }
-
-
 
     case UART_RX_BUF_RELEASED:
-
         mark_rx_buf_free(evt->data.rx_buf.buf);
-
         break;
-
-
 
     case UART_RX_DISABLED: {
-
         uint8_t *buf = claim_rx_buf();
-
         if (buf != NULL) {
-
             (void)uart_rx_enable(dev, buf, UART_RX_BUF_SIZE, 5000);
-
         }
-
         break;
-
     }
-
-
 
     case UART_RX_STOPPED:
-
         (void)uart_rx_disable(dev);
-
         break;
-
-
 
     default:
-
         break;
-
     }
-
 }
 
 
@@ -1748,6 +1610,7 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
     }
 
 
+    // check the uart is ready.
     if (!device_is_ready(uart_dev)) {
         return -1;
     }
@@ -1790,7 +1653,6 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
     tx_done_len_mismatch_count = 0;
     tx_done_zero_len_count = 0;
 
-
     uart_rx_buf_a_in_use = false;
     uart_rx_buf_b_in_use = false;
 
@@ -1807,6 +1669,7 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
 
     next_transport_stats_ms = k_uptime_get() + 10000;
 
+    //set the uart callback for the uart device
     if (uart_callback_set(uart_dev, uart_cb, NULL) != 0) {
         return -1;
     }
@@ -1817,6 +1680,9 @@ int gateway_interface_init(const gateway_interface_callbacks_t *callbacks)
         return -1;
     }
 
+    // enable the receive on the uart device with a timeout of 5000ms
+    // The timeout can be disabled by passing SYS_FOREVER_US.
+    // The uart rx path is to recieve commands from the host. 
     if (uart_rx_enable(uart_dev, buf, UART_RX_BUF_SIZE, 5000) != 0) {
         return -1;
     }
@@ -1858,72 +1724,41 @@ int gateway_interface_reset_transport_state(void)
     tx_stream_backlog_max_ms = 0;
 
     tx_control_enqueue_success_count = 0;
-
     tx_control_enqueue_drop_count = 0;
-
     tx_stream_enqueue_success_count = 0;
-
     tx_stream_enqueue_drop_count = 0;
-
     tx_control_bytes_enqueued = 0;
-
     tx_stream_bytes_enqueued = 0;
-
     tx_control_bytes_dequeued = 0;
-
     tx_stream_bytes_dequeued = 0;
-
     tx_control_tx_done_count = 0;
-
     tx_stream_tx_done_count = 0;
-
     tx_control_tx_aborted_count = 0;
-
     tx_stream_tx_aborted_count = 0;
-
     tx_control_tx_start_failures = 0;
-
     tx_stream_tx_start_failures = 0;
-
     tx_done_len_mismatch_count = 0;
-
     tx_done_zero_len_count = 0;
-
     tx_active_queue_kind = TX_QUEUE_CONTROL;
-
     tx_active_len = 0;
-
-
     tx_active_started_ms = 0;
-
     tx_stuck_count = 0;
-
     tx_stuck_reported = false;
-
     tx_recovery_in_progress = false;
-
-
     tx_done_buffer_pointer_mismatches = 0;
-
     tx_in_progress = false;
 
     irq_unlock(key);
-
     next_transport_stats_ms = k_uptime_get() + 2000;
-
     return 0;
-
 }
 
-
-
 int gateway_interface_poll(void)
-
 {
-
     static char line[RX_LINE_MAX];
     int64_t now = k_uptime_get();
     bool recover_stuck_tx = false;
+
     unsigned int key = irq_lock();
 
     if (tx_stream_count > 0) {
@@ -1997,17 +1832,26 @@ int gateway_interface_poll(void)
 
     }
 
+
+    // rx path
+
+    // if the line is not ready yet return 0, the line will be processed in the next poll
     if (!pending_line_ready) {
         return 0;
     }
 
     key = irq_lock();
 
+    // this checks again to be sure. probably not need but just to be safe.
     if (!pending_line_ready) {
         irq_unlock(key);
         return 0;
     }
 
+    // memcpy(destination, source, number_of_bytes);
+
+    //copies the line to be sent out and sets the pending line ready to false so that the next line can be processed
+    // essentialy releasing pending line
     memcpy(line, pending_line, sizeof(line));
     pending_line_ready = false;
 
@@ -2023,137 +1867,53 @@ int gateway_interface_poll(void)
     }
 
     return 0;
-
 }
-
-
-int gateway_interface_send_event(const gateway_event_t *event)
-
-{
-
-    if (event == NULL) {
-
-        return -1;
-
-    }
-
-
-
-    return 0;
-
-}
-
-
-
-int gateway_interface_send_frame(const gateway_sensor_frame_t *frame)
-
-{
-
-    if (frame == NULL) {
-
-        return -1;
-
-    }
-
-
-
-    return 0;
-
-}
-
-
 
 int gateway_interface_send_log(const char *message)
-
 {
-
     if (message == NULL) {
-
         return -1;
-
     }
-
-
-
     return gateway_interface_send_json_line(message);
-
 }
 
-
-
 int gateway_interface_send_ready(void)
-
 {
 
     return gateway_interface_send_json_line(
-
         "{\"type\":\"ready\","
-
         "\"protocol_version\":1,"
-
         "\"device\":\"nrf54l15-dk\","
-
         "\"app\":\"rs-nexus-ble-gateway\"}"
-
     );
-
 }
-
 
 
 int gateway_interface_send_hello_ack(const char *request_id)
-
 {
-
     char line[192];
 
-
-
     if (request_id != NULL && request_id[0] != '\0') {
-
         snprintf(
-
             line,
-
             sizeof(line),
-
             "{\"type\":\"hello_ack\","
-
             "\"request_id\":\"%s\","
-
             "\"ok\":true,"
-
             "\"protocol_version\":1}",
-
             request_id
-
         );
-
     } else {
-
         snprintf(
-
             line,
-
             sizeof(line),
-
             "{\"type\":\"hello_ack\","
-
             "\"ok\":true,"
-
             "\"protocol_version\":1}"
-
         );
-
     }
-
-
-
     return gateway_interface_send_json_line(line);
-
 }
-
-
 
 int gateway_interface_send_status(const char *request_id)
 {
@@ -2204,15 +1964,11 @@ int gateway_interface_send_status(const char *request_id)
 
 
 int gateway_interface_send_transport_stats(void)
-
 {
-
     char line[1280];
-
     unsigned int key = irq_lock();
 
     const size_t control_ring_count = tx_control_count;
-
     const size_t stream_ring_count = tx_stream_count;
     const uint32_t pacing_delays = tx_stream_pacing_delays;
     const size_t stream_high_water = tx_stream_high_water_bytes;
@@ -2223,126 +1979,66 @@ int gateway_interface_send_transport_stats(void)
         ? backlog_age : tx_stream_backlog_max_ms;
 
     const uint32_t control_ring_drops = tx_control_drop_count;
-
     const uint32_t stream_ring_drops = tx_stream_drop_count;
-
     const uint32_t control_enqueue_success = tx_control_enqueue_success_count;
-
     const uint32_t control_enqueue_drops = tx_control_enqueue_drop_count;
-
     const uint32_t stream_enqueue_success = tx_stream_enqueue_success_count;
-
     const uint32_t stream_enqueue_drops = tx_stream_enqueue_drop_count;
-
     const uint32_t control_enqueued = tx_control_bytes_enqueued;
-
     const uint32_t stream_enqueued = tx_stream_bytes_enqueued;
-
     const uint32_t control_dequeued = tx_control_bytes_dequeued;
-
     const uint32_t stream_dequeued = tx_stream_bytes_dequeued;
-
     const uint32_t control_tx_done = tx_control_tx_done_count;
-
     const uint32_t stream_tx_done = tx_stream_tx_done_count;
-
     const uint32_t control_tx_aborted = tx_control_tx_aborted_count;
-
     const uint32_t stream_tx_aborted = tx_stream_tx_aborted_count;
-
     const uint32_t control_tx_failures = tx_control_tx_start_failures;
-
     const uint32_t stream_tx_failures = tx_stream_tx_start_failures;
-
     const uint32_t tx_done_len_mismatches = tx_done_len_mismatch_count;
-
     const uint32_t tx_done_zero_len = tx_done_zero_len_count;
 
-
     const uint32_t tx_buffer_pointer_mismatches =
-
         tx_done_buffer_pointer_mismatches;
-
     const uint32_t stuck_count = tx_stuck_count;
-
     const uint32_t active_age_ms =
-
         tx_in_progress && tx_active_started_ms > 0
-
             ? (uint32_t)(k_uptime_get() - tx_active_started_ms)
-
             : 0U;
 
-
-
     const bool in_progress = tx_in_progress;
-
     const unsigned int active_queue_kind = (unsigned int)tx_active_queue_kind;
-
     const unsigned int active_len = (unsigned int)tx_active_len;
-
     irq_unlock(key);
 
-
-
     snprintf(
-
         line,
-
         sizeof(line),
-
         "{\"type\":\"gateway_transport_stats\","
-
         "\"control_ring_bytes\":%u,"
-
         "\"stream_ring_bytes\":%u,"
-
         "\"control_ring_drops\":%u,"
-
         "\"stream_ring_drops\":%u,"
-
         "\"control_enqueue_success\":%u,"
-
         "\"control_enqueue_drops\":%u,"
-
         "\"stream_enqueue_success\":%u,"
-
         "\"stream_enqueue_drops\":%u,"
-
         "\"control_bytes_enqueued\":%u,"
-
         "\"stream_bytes_enqueued\":%u,"
-
         "\"control_bytes_dequeued\":%u,"
-
         "\"stream_bytes_dequeued\":%u,"
-
         "\"control_tx_done\":%u,"
-
         "\"stream_tx_done\":%u,"
-
         "\"control_tx_aborted\":%u,"
-
         "\"stream_tx_aborted\":%u,"
-
         "\"control_tx_start_failures\":%u,"
-
         "\"stream_tx_start_failures\":%u,"
-
         "\"tx_done_len_mismatches\":%u,"
-
         "\"tx_done_zero_len\":%u,"
-
         "\"tx_done_buffer_pointer_mismatches\":%u,"
-
         "\"tx_stuck_count\":%u,"
-
         "\"tx_active_age_ms\":%u,"
-
         "\"tx_in_progress\":%s,"
-
         "\"active_queue_kind\":%u,"
-
         "\"active_len\":%u,"
         "\"stream_tx_gap_ms\":%u,"
         "\"stream_pacing_delays\":%u,"
@@ -2352,56 +2048,31 @@ int gateway_interface_send_transport_stats(void)
         "\"stream_backlog_max_ms\":%u}",
 
         (unsigned int)control_ring_count,
-
         (unsigned int)stream_ring_count,
-
         (unsigned int)control_ring_drops,
-
         (unsigned int)stream_ring_drops,
-
         (unsigned int)control_enqueue_success,
-
         (unsigned int)control_enqueue_drops,
-
         (unsigned int)stream_enqueue_success,
-
         (unsigned int)stream_enqueue_drops,
-
         (unsigned int)control_enqueued,
-
         (unsigned int)stream_enqueued,
-
         (unsigned int)control_dequeued,
-
         (unsigned int)stream_dequeued,
-
         (unsigned int)control_tx_done,
-
         (unsigned int)stream_tx_done,
-
         (unsigned int)control_tx_aborted,
-
         (unsigned int)stream_tx_aborted,
-
         (unsigned int)control_tx_failures,
-
         (unsigned int)stream_tx_failures,
-
         (unsigned int)tx_done_len_mismatches,
-
         (unsigned int)tx_done_zero_len,
-
-
         (unsigned int)tx_buffer_pointer_mismatches,
-
         (unsigned int)stuck_count,
-
         (unsigned int)active_age_ms,
 
         in_progress ? "true" : "false",
-
         active_queue_kind,
-
         active_len,
         (unsigned int)GATEWAY_STREAM_TX_GAP_MS,
         (unsigned int)pacing_delays,
@@ -2409,175 +2080,89 @@ int gateway_interface_send_transport_stats(void)
         (unsigned int)pressure_events,
         (unsigned int)backlog_age,
         (unsigned int)backlog_max
-
     );
-
-
-
     return gateway_interface_send_json_line(line);
-
 }
-
-
 
 int gateway_interface_send_error(
-
     const char *request_id,
-
     const char *message,
-
     int error_code
-
 )
-
 {
-
     char line[256];
-
-
-
     if (message == NULL) {
-
         return -1;
-
     }
-
-
 
     if (request_id != NULL && request_id[0] != '\0') {
-
         snprintf(
-
             line,
-
             sizeof(line),
-
             "{\"type\":\"error\","
-
             "\"request_id\":\"%s\","
-
             "\"error_code\":%d,"
-
             "\"message\":\"%s\"}",
-
             request_id,
-
             error_code,
-
             message
-
         );
-
     } else {
-
         snprintf(
-
             line,
-
             sizeof(line),
-
             "{\"type\":\"error\","
-
             "\"error_code\":%d,"
-
             "\"message\":\"%s\"}",
-
             error_code,
-
             message
-
         );
-
     }
-
-
 
     return gateway_interface_send_json_line(line);
-
 }
 
-
-
 int gateway_interface_send_not_implemented(
-
     const char *request_id,
-
     const char *command_name
-
 )
-
 {
-
     char message[128];
-
-
-
     if (command_name == NULL) {
-
         return gateway_interface_send_error(
-
             request_id,
-
             "not_implemented",
-
             -2
-
         );
-
     }
 
-
-
     snprintf(
-
         message,
-
         sizeof(message),
-
         "%s_not_implemented",
-
         command_name
-
     );
 
-
-
     return gateway_interface_send_error(request_id, message, -2);
-
 }
 
 
 
 int gateway_interface_send_json_line(const char *json)
-
 {
-
     if (json == NULL) {
-
         return -1;
-
     }
-
-
 
     if (transport_write_str(TX_QUEUE_CONTROL, json) != 0) {
-
         return -12;
-
     }
-
-
 
     if (transport_write_str(TX_QUEUE_CONTROL, "\n") != 0) {
-
         return -12;
-
     }
 
-
-
     return 0;
-
 }
 
 int gateway_interface_send_stream_frame(
@@ -2599,7 +2184,6 @@ int gateway_interface_send_stream_frame(
         payload_len = GATEWAY_MAX_FRAME_PAYLOAD;
     }
 
-
     frame[index++] = 0xA5;
     frame[index++] = 0x5A;
     frame[index++] = 0x01;
@@ -2619,5 +2203,4 @@ int gateway_interface_send_stream_frame(
 
     frame[index++] = checksum;
     return transport_write_bytes(TX_QUEUE_STREAM, frame, index);
-
 }
